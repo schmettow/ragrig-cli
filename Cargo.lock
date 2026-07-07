@@ -3956,15 +3956,14 @@ dependencies = [
 
 [[package]]
 name = "ragrig"
-version = "0.9.6"
+version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d1896d34983cf3a40b0885c2aba786a7381f63ee0d17e8a3cb1ff16d9a3f170"
+checksum = "82d5c6beae294ccfbde9cc8927a260585a7f149e427a7c6330d241c0b44714a3"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chunkedrs",
- "clap",
  "epub-parser",
  "fastembed",
  "hayro",
@@ -3976,14 +3975,11 @@ dependencies = [
  "rig-core",
  "rmp-serde",
  "roxmltree 0.21.1",
- "rustyline",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "unpdf",
  "urlencoding",
  "walkdir",
@@ -3991,8 +3987,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ragrig-bin"
-version = "0.1.0"
+name = "ragrig-cli"
+version = "0.9.7"
 dependencies = [
  "anyhow",
  "clap",

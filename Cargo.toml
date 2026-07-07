@@ -1,6 +1,6 @@
 [package]
-name = "ragrig-bin"
-version = "0.5.0"
+name = "ragrig-cli"
+version = "0.9.7"
 edition = "2024"
 description = "Command line interface for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
@@ -13,7 +13,7 @@ kreuzberg = ["ragrig/kreuzberg"]
 
 [dependencies]
 #ragrig = { path = "../ragrig" }
-ragrig = { version = "0.9.6" }
+ragrig = { version = "0.9.7" }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
