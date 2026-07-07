@@ -2,18 +2,33 @@
 name = "ragrig-cli"
 version = "0.9.7"
 edition = "2024"
-description = "Command line interface for the Ragrig RAG framework — paper search, chat, and document indexing."
+description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
 repository = "https://github.com/schmettow/ragrig-cli"
+readme = "README.md"
+keywords = ["rag", "llm", "cli", "repl", "ollama", "arxiv", "semantic-scholar"]
+categories = ["command-line-utilities", "science"]
 
 [features]
-default = []
+default = ["internal", "ollama-embed"]
+internal = ["ragrig/internal"]
+ollama-embed = ["ragrig/ollama-embed"]
 internal-embed = ["ragrig/internal-embed"]
+internal-generate = ["ragrig/internal-generate"]
+internal-generate-cuda = ["ragrig/internal-generate-cuda"]
+internal-generate-metal = ["ragrig/internal-generate-metal"]
+internal-generate-mkl = ["ragrig/internal-generate-mkl"]
+offline = ["ragrig/offline"]
+offline-cuda = ["ragrig/offline-cuda"]
+offline-metal = ["ragrig/offline-metal"]
+offline-mkl = ["ragrig/offline-mkl"]
+lancedb = ["ragrig/lancedb"]
+test-fixtures = ["ragrig/test-fixtures"]
 kreuzberg = ["ragrig/kreuzberg"]
+all = ["ragrig/all"]
 
 [dependencies]
-#ragrig = { path = "../ragrig" }
-ragrig = { version = "0.9.7" }
+ragrig = "0.9.7"
 
 # ── CLI / REPL ──────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
