@@ -6,7 +6,7 @@ description = "REPL binary for the Ragrig RAG framework — paper search, chat, 
 license = "MIT"
 repository = "https://github.com/schmettow/ragrig-cli"
 readme = "README.md"
-keywords = ["rag", "llm", "cli", "repl", "ollama", "arxiv", "semantic-scholar"]
+keywords = ["rag", "llm", "repl", "ollama"]
 categories = ["command-line-utilities", "science"]
 
 [features]
