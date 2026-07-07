@@ -3957,11 +3957,14 @@ dependencies = [
 [[package]]
 name = "ragrig"
 version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d1896d34983cf3a40b0885c2aba786a7381f63ee0d17e8a3cb1ff16d9a3f170"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chunkedrs",
+ "clap",
  "epub-parser",
  "fastembed",
  "hayro",
@@ -3973,11 +3976,14 @@ dependencies = [
  "rig-core",
  "rmp-serde",
  "roxmltree 0.21.1",
+ "rustyline",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "unpdf",
  "urlencoding",
  "walkdir",
@@ -4484,7 +4490,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5172,10 +5178,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

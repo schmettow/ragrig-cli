@@ -1,6 +1,6 @@
 [package]
 name = "ragrig-bin"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
@@ -12,7 +12,8 @@ internal-embed = ["ragrig/internal-embed"]
 kreuzberg = ["ragrig/kreuzberg"]
 
 [dependencies]
-ragrig = { path = "../ragrig" }
+#ragrig = { path = "../ragrig" }
+ragrig = { version = "0.9.6" }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
