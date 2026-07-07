@@ -2,9 +2,9 @@
 name = "ragrig-bin"
 version = "0.5.0"
 edition = "2024"
-description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
+description = "Command line interface for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
-repository = "https://github.com/schmettow/ragrig"
+repository = "https://github.com/schmettow/ragrig-cli"
 
 [features]
 default = []
