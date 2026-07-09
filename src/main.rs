@@ -63,7 +63,7 @@ struct CliChatConfig {
 struct CliEmbedConfig {
     #[arg(long = "embedding-provider", default_value = "ollama")]
     pub embedding_provider: String,
-    #[arg(short = 'e', long = "embedding-model", default_value = "nomic-embed-text")]
+    #[arg(short = 'e', long = "embedding-model", default_value = "nomic-embed-text:latest")]
     pub embedding_model: String,
     #[arg(long, default_value = "50")]
     pub top_k: usize,
@@ -263,7 +263,7 @@ struct Session {
 /// treated as a RAG query (`RagQuery`).
 enum Command {
     #[allow(dead_code)]
-    
+
     Download(String),
     GetPapers(String),
     Help,
@@ -2389,7 +2389,7 @@ mod tests {
                 ..Default::default()
             },
             embed: EmbedConfig {
-                model: "nomic-embed-text".into(),
+                model: "nomic-embed-text:latest".into(),
                 ..Default::default()
             },
             ..Default::default()
