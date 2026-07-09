@@ -254,6 +254,15 @@ deployments.
 
 For version 2.0, we plan to provide Python and possibly R bindings.
 
+### Embeddings model not found
+
+If you see *Embedding model nomic-embed-text not found*, although you have pulled it with Ollama,
+you are most likely using an older version of Ollama, which needs the full name of the model: *nomic-embed-text:latest*
+
+Update your Ollama installation to the latest version to avoid this issue. 
+Or use the full model name in a profile configuration (`-p` or `--profile`).
+Or use command line argument (`--embedding_model nomic-embed-text:latest`).
+
 ### Ollama is unreachable — what should I check?
 
 If ragrig-bin reports `OllamaUnreachable`, work through these in order:
