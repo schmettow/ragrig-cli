@@ -8,7 +8,7 @@ use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 use ragrig::{
-    ChatAgentSpec, ChunkConfig, DocumentParser, DocumentParsers,
+    ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser, DocumentParsers,
     DocumentType, EmbedderSpec, EpubParserBackend, FsSessionStore, GenerationParams,
     HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory, MmrDiversityRanker, PaperResult,
     RagAgent, RagrigError, Ranker, ScoredChunk, SessionId,
@@ -138,6 +138,7 @@ impl From<CliChatConfig> for ChatConfig {
                 _ => ContextSizeMode::Auto,
             },
             system_prompt_path: c.prompt_chat,
+            request_timeout_secs: None,
         }
     }
 }
@@ -153,6 +154,7 @@ impl From<CliEmbedConfig> for EmbedConfig {
             model: c.embedding_model,
             top_k: c.top_k,
             similarity_threshold: c.similarity_threshold,
+            request_timeout_secs: None,
         }
     }
 }
@@ -346,11 +348,12 @@ async fn bootstrap(
 
     // Build the initial chat agent from config.
     let initial_spec = match config.chat.provider {
-        Provider::Ollama => ChatAgentSpec::ollama(config.chat.model.clone(), chat_params.clone()),
+        Provider::Ollama => ChatAgentSpec::ollama(config.chat.model.clone(), chat_params.clone(), None),
         Provider::Deepseek => ChatAgentSpec::deepseek(
             config.chat.deepseek_model.clone(),
             config.chat.deepseek_api_key.clone(),
             chat_params.clone(),
+            None,
         ),
     };
     let chat_agent = initial_spec.build()?;
@@ -366,6 +369,7 @@ async fn bootstrap(
     let embedder_spec = match config.embed.provider {
         EmbeddingProvider::Ollama => EmbedderSpec::Ollama {
             model: config.embed.model.clone(),
+            request_timeout_secs: None,
         },
         #[cfg(feature = "internal-embed")]
         EmbeddingProvider::Fastembed => EmbedderSpec::Fastembed,
@@ -402,7 +406,7 @@ async fn bootstrap(
     let store = store::open_store(&config.folder).await?;
 
     // Determine whether we need to build from scratch or update incrementally.
-    let chunk_cfg = ChunkConfig { size: config.parse.chunk_size, overlap: config.parse.chunk_overlap };
+    let chunk_cfg = ChunkConfig::new(config.parse.chunk_size, config.parse.chunk_overlap)?;
     if store.is_empty() {
         info!("No existing store found. Creating new one...");
         collect_documents(&*embedder, &doc_parsers, &config.folder, &chunk_cfg, &*store).await?;
@@ -466,7 +470,7 @@ async fn bootstrap(
     info!("Vector store initialized with {} total entries.", row_count);
 
     // Build the rewrite (memory) agent.
-    let memory_spec = ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone());
+    let memory_spec = ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone(), None);
     let memory_agent = memory_spec.build()?;
     info!(
         "Memory: {} ({})",
@@ -494,7 +498,7 @@ async fn bootstrap(
         agent_builder = agent_builder.rewrite_prompt(rewrite_text);
     }
 
-    let agent = agent_builder.build();
+    let agent = agent_builder.build()?;
 
     let pdf_parser = config.parse.pdf_parser.clone();
     let context_size_forced = config.chat.context_size_mode;
@@ -700,10 +704,11 @@ impl Session {
             self.agent.embedder(),
             &self.doc_parsers,
             &self.config.folder,
-            &ChunkConfig { size: self.config.parse.chunk_size, overlap: self.config.parse.chunk_overlap },
+            &ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
             &self.http_client,
             self.agent.store(),
             url,
+            Some(DEFAULT_MAX_DOWNLOAD_BYTES),
         )
         .await
         {
@@ -770,10 +775,11 @@ impl Session {
                 self.agent.embedder(),
                 &self.doc_parsers,
                 &self.config.folder,
-                &ChunkConfig { size: self.config.parse.chunk_size, overlap: self.config.parse.chunk_overlap },
+                &ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
                 &self.http_client,
                 self.agent.store(),
                 &url,
+                Some(DEFAULT_MAX_DOWNLOAD_BYTES),
             )
             .await
             {
@@ -1381,7 +1387,7 @@ impl Session {
                 "Re-indexing all documents in {}...",
                 self.config.folder.display()
             );
-            let chunk_cfg = ChunkConfig { size: self.config.parse.chunk_size, overlap: self.config.parse.chunk_overlap };
+            let chunk_cfg = ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
             let stats = collect_documents_with_stats(self.agent.embedder(), &self.doc_parsers, &self.config.folder, &chunk_cfg, self.agent.store()).await?;
             info!(
                 "Re-indexing complete. Store size: {} chunks.",
@@ -1608,6 +1614,7 @@ impl Session {
             let summary_spec = ChatAgentSpec::ollama(
                 self.config.memory.model.clone(),
                 GenerationParams::default(),
+                None,
             );
             match summary_spec.build() {
                 Ok(summary_agent) => {
