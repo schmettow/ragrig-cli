@@ -7512,9 +7512,7 @@ dependencies = [
 
 [[package]]
 name = "ragrig"
-version = "0.9.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82d5c6beae294ccfbde9cc8927a260585a7f149e427a7c6330d241c0b44714a3"
+version = "0.9.8"
 dependencies = [
  "anyhow",
  "arrow-array 59.1.0",
@@ -7524,6 +7522,7 @@ dependencies = [
  "candle-core",
  "candle-transformers",
  "chunkedrs",
+ "dyn-clone",
  "epub-parser",
  "fastembed",
  "futures-util",
@@ -7543,6 +7542,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.18",
  "tokenizers 0.23.1",
  "tokio",
  "tracing",
@@ -7554,7 +7554,7 @@ dependencies = [
 
 [[package]]
 name = "ragrig-cli"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "anyhow",
  "clap",
