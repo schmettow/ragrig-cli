@@ -7325,6 +7325,8 @@ dependencies = [
 [[package]]
 name = "ragrig"
 version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "310c7d82af38a37bd64047cea48a471cfce38a0304e8808ad42f9f79be732ca1"
 dependencies = [
  "anyhow",
  "arrow-array 59.1.0",
