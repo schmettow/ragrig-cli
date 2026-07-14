@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.8] — 2026-07-11
 
+### Added
+
+- **`/attach <file>` command** — attach a PDF, EPUB, DOCX, HTML, or Markdown
+  file for the next RAG query.  The file is parsed inline (using the active
+  document parsers) and its full text is injected into the prompt alongside
+  vector store results via the `PrependAttach` strategy.  Attachments are
+  one-shot — they are cleared automatically after each query.
+  - `/attach` — list currently attached files.
+  - `/attach clear` — remove all attachments.
+- **`/search by <file>` command** — use a document file as the search query.
+  Parses the file, chunks it, embeds each chunk, and finds similar documents
+  in the database via `search_by_document()`.  Results are stored in
+  `last_results` so `/refs` and `/get` work automatically.
+
 ### Changed
 
 - **Aligned with ragrig v0.9.8 API** — all breaking changes from the library

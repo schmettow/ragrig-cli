@@ -14,6 +14,7 @@ use ragrig::{
     MmrDiversityRanker, PaperResult, PrependAttach, RagAgent, RagrigError, Ranker, ScoredChunk,
     SessionId, SessionStore, SummaryHistory, Turn, TurnRole, WeightedFusionRanker,
     collect_documents, collect_documents_with_stats, download_and_ingest_url, embed_documents,
+    search_by_document,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, FileHashEntry, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::documents::{HashMetadata, get_document_file_hashes, get_changed_documents, update_file_hashes};
@@ -896,7 +897,7 @@ impl Session {
         println!("/download <url>  — download and ingest a PDF into the document pool");
         println!("/scholar <q>   — search Semantic Scholar (free API key for higher limits)");
         println!("/arxiv <q>      — search arXiv (no API key needed, no rate limits)");
-        println!("/search         — show / adjust search parameters (topk, threshold, rank)");
+        println!("/search         — show / adjust search parameters (topk, threshold, rank, by)");
         println!("/get 1,2,3-4    — download papers by number from last search");
         println!(
             "/refs [topic]   — extract references from last query results (optionally filtered by topic)"
@@ -999,6 +1000,7 @@ impl Session {
             } else {
                 println!("  ranker:    (opaque — store backend handles ranking)");
             }
+            println!("  /search by <file> — use a document as the search query");
             return Ok(());
         }
 
@@ -1188,10 +1190,88 @@ impl Session {
             return Ok(());
         }
 
+        if sub == "by" {
+            let file = parts.next().unwrap_or("");
+            if file.is_empty() {
+                println!("Usage: /search by <file>  — use a document as the search query");
+                println!("  Parses the file, chunks it, and finds similar documents in the database.");
+                return Ok(());
+            }
+            return self.cmd_search_by_doc(file).await;
+        }
+
         println!(
-            "Unknown subcommand: '{}'. Use /search, /search topk <N>, /search threshold <F>, or /search rank <name>.",
+            "Unknown subcommand: '{}'. Use /search, /search topk <N>, /search threshold <F>, /search rank <name>, or /search by <file>.",
             sub
         );
+        Ok(())
+    }
+
+    /// Search the database using a document file as the query.
+    /// Parses the file, chunks it, embeds each chunk, and finds similar
+    /// documents in the vector store.
+    async fn cmd_search_by_doc(&mut self, file_path: &str) -> Result<()> {
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            error!("File not found: {}", file_path);
+            return Ok(());
+        }
+        if !path.is_file() {
+            error!("Not a regular file: {}", file_path);
+            return Ok(());
+        }
+
+        let chunk_cfg = ChunkConfig::new(
+            self.config.parse.chunk_size,
+            self.config.parse.chunk_overlap,
+        )?;
+
+        info!(
+            "Search-by-document: '{}' (k={}, threshold={:.3})",
+            file_path,
+            self.agent.top_k(),
+            self.agent.similarity_threshold()
+        );
+
+        match search_by_document(
+            self.agent.embedder(),
+            self.agent.store(),
+            &self.doc_parsers,
+            path,
+            &chunk_cfg,
+            self.agent.top_k(),
+            self.agent.similarity_threshold(),
+        )
+        .await
+        {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!("No similar documents found.");
+                } else {
+                    println!(
+                        "Found {} similar chunks (from document '{}'):",
+                        results.len(),
+                        file_path
+                    );
+                    for (i, sc) in results.iter().enumerate() {
+                        println!(
+                            "  [{:2}] {:.4}  {} — {:.100}",
+                            i + 1,
+                            sc.score,
+                            sc.chunk.source_file,
+                            sc.chunk.text.trim()
+                        );
+                    }
+                }
+                self.last_results = results;
+                if !self.last_results.is_empty() {
+                    println!("\nUse /refs to extract references from these results.");
+                }
+            }
+            Err(e) => {
+                RagrigError::log_or(&e, "Search-by-document failed");
+            }
+        }
         Ok(())
     }
 

@@ -84,6 +84,9 @@ Query > What are the key findings about forced-choice paradigms?
 | Command | Action |
 |---|---|
 | Any text | RAG query against your document pool |
+| `/attach <file>` | Attach a document for the next query (one-shot, not indexed) |
+| `/attach` | Show currently attached files |
+| `/attach clear` | Clear all attachments |
 | `/download <url>` | Download and ingest a document by URL |
 | `/get 1,2,3-4,8` | Bulk-download papers from last search results |
 | `/scholar <query>` | Search Semantic Scholar |
@@ -96,7 +99,7 @@ Query > What are the key findings about forced-choice paradigms?
 | `/parser pdf unpdf\|sink\|extract\|internal\|vision \| epub epub` | Hot-swap document parser per format |
 | `/log [off\|error\|warn\|info\|debug\|trace]` | Show or change log verbosity at runtime |
 | `/profile save\|show\|load\|list [name]` | Manage configuration profiles |
-| `/search rank <name> [key value]*` | Hot-swap chunk ranking algorithm |
+| `/search topk <N> \| threshold <F> \| rank <name> \| by <file>` | Tune retrieval or search by document |
 | `/hist [list \| load <id> \| delete <id>]` | Manage saved sessions |
 | `/help` | Show available commands |
 | `exit` / `quit` | End session |
