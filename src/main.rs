@@ -8,11 +8,11 @@ use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 use ragrig::{
-    ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser, DocumentParsers,
-    DocumentType, EmbedderSpec, EpubParserBackend, FsSessionStore, GenerationParams,
-    HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory, MmrDiversityRanker, PaperResult,
-    RagAgent, RagrigError, Ranker, ScoredChunk, SessionId,
-    SessionStore, SummaryHistory, Turn, TurnRole, WeightedFusionRanker,
+    AttachedDocument, ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser,
+    DocumentParsers, DocumentType, EmbedderSpec, EpubParserBackend, FsSessionStore,
+    GenerationParams, HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory,
+    MmrDiversityRanker, PaperResult, PrependAttach, RagAgent, RagrigError, Ranker, ScoredChunk,
+    SessionId, SessionStore, SummaryHistory, Turn, TurnRole, WeightedFusionRanker,
     collect_documents, collect_documents_with_stats, download_and_ingest_url, embed_documents,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, FileHashEntry, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
@@ -248,6 +248,9 @@ struct Session {
     /// Controls context-overflow behaviour: `Auto` retries with fewer chunks,
     /// `Forced` treats overflow as a fatal error.
     context_size_forced: ContextSizeMode,
+    /// Externally attached documents — parsed text injected into the next
+    /// RAG query.  Cleared after each query (one-shot by default).
+    attached_docs: Vec<AttachedDocument>,
     /// Whether in-session transcript memory is enabled.  `false` when the
     /// user runs `/memory off` — turns are not accumulated and the
     /// transcript passed to the agent is always empty.
@@ -266,6 +269,7 @@ struct Session {
 enum Command {
     #[allow(dead_code)]
 
+    Attach(String),
     Download(String),
     GetPapers(String),
     Help,
@@ -484,6 +488,7 @@ async fn bootstrap(
         .embed(embedder)
         .store(store)
         .rewriter(memory_agent)
+        .attach_strategy(Box::new(PrependAttach))
         .context_tokens(config.chat.context_tokens)
         .top_k(config.embed.top_k)
         .similarity_threshold(config.embed.similarity_threshold);
@@ -537,6 +542,7 @@ async fn bootstrap(
         history_path,
         http_client: reqwest::Client::new(),
         prompt_memory: Vec::new(),
+        attached_docs: Vec::new(),
         session_store,
         session_id,
         history_strategy: None,
@@ -578,6 +584,10 @@ impl From<&str> for Command {
             }
         };
 
+        if input.starts_with("/attach") {
+            let arg = after("/attach").trim().to_string();
+            return Command::Attach(arg);
+        }
         if input.starts_with("/download ") {
             let url = strip_ansi(after("/download ")).trim().to_string();
             return Command::Download(url);
@@ -664,6 +674,7 @@ impl Session {
 
     async fn execute(&mut self, cmd: Command) -> Result<()> {
         match cmd {
+            Command::Attach(arg) => self.cmd_attach(&arg).await,
             Command::Download(url) => self.cmd_download(&url).await,
             Command::GetPapers(range) => self.cmd_get_papers(&range).await,
             Command::Help => {
@@ -689,6 +700,73 @@ impl Session {
             }
             Command::Exit => Ok(()),
         }
+    }
+
+    // ── /attach <file> ─────────────────────────────────────────────────
+
+    /// Parse a file into text and store it as an attachment for the next
+    /// RAG query.  The attachment is one-shot: it is cleared after the
+    /// next query (unless re-attached).
+    ///
+    /// Usage:
+    ///   /attach <file>            — attach a PDF, EPUB, DOCX, HTML, or MD file
+    ///   /attach                  — show currently attached files
+    ///   /attach clear            — clear all attachments
+    async fn cmd_attach(&mut self, file_path: &str) -> Result<()> {
+        if file_path.is_empty() {
+            if self.attached_docs.is_empty() {
+                println!("No files attached. Usage: /attach <file>  |  /attach clear");
+            } else {
+                println!("Attached files:");
+                for doc in &self.attached_docs {
+                    println!("  {} ({} chars)", doc.name, doc.content.len());
+                }
+                println!("Use /attach clear to remove all attachments.");
+            }
+            return Ok(());
+        }
+
+        if file_path.eq_ignore_ascii_case("clear") {
+            let count = self.attached_docs.len();
+            self.attached_docs.clear();
+            println!("Cleared {} attached document(s).", count);
+            return Ok(());
+        }
+
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            error!("File not found: {}", file_path);
+            return Ok(());
+        }
+        if !path.is_file() {
+            error!("Not a regular file: {}", file_path);
+            return Ok(());
+        }
+
+        // Parse the file using the existing document parsers.
+        match ragrig::extract_text(&self.doc_parsers, path) {
+            Ok(text) => {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| file_path.to_string());
+                let chars = text.len();
+                self.attached_docs.push(AttachedDocument {
+                    name: name.clone(),
+                    content: text,
+                });
+                println!(
+                    "Attached: {} ({} chars, {} total attached)",
+                    name,
+                    chars,
+                    self.attached_docs.len()
+                );
+            }
+            Err(e) => {
+                error!("Failed to parse {}: {}", file_path, e);
+            }
+        }
+        Ok(())
     }
 
     // ── /download <url> ───────────────────────────────────────────────
@@ -812,6 +890,9 @@ impl Session {
     // ── /help ────────────────────────────────────────────────────────
 
     fn cmd_help(&self) {
+        println!("/attach <file>  — attach a document for the next query (one-shot, not indexed)");
+        println!("/attach         — show currently attached files");
+        println!("/attach clear   — clear all attachments");
         println!("/download <url>  — download and ingest a PDF into the document pool");
         println!("/scholar <q>   — search Semantic Scholar (free API key for higher limits)");
         println!("/arxiv <q>      — search arXiv (no API key needed, no rate limits)");
@@ -2015,14 +2096,40 @@ impl Session {
             self.agent.chat_agent().model_name()
         );
 
+        let has_attachments = !self.attached_docs.is_empty();
+        if has_attachments {
+            debug!(
+                "Attachments: {} document(s) — {}",
+                self.attached_docs.len(),
+                self.attached_docs
+                    .iter()
+                    .map(|d| format!("{} ({} chars)", d.name, d.content.len()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         print!("Assistant > ");
         stdout().flush()?;
 
         let start = std::time::Instant::now();
-        let response = self
-            .agent
-            .generate_with_turns(&effective_query, turns)
-            .await;
+        let response = if has_attachments {
+            self.agent
+                .generate_with_turns_and_attachment(
+                    &effective_query,
+                    turns,
+                    &self.attached_docs,
+                )
+                .await
+        } else {
+            self.agent
+                .generate_with_turns(&effective_query, turns)
+                .await
+        };
+
+        // Attachments are one-shot — clear after use.
+        let cleared_count = self.attached_docs.len();
+        self.attached_docs.clear();
 
         match response {
             Ok(resp) => {
@@ -2050,16 +2157,22 @@ impl Session {
                 // Info header.
                 let chunks = resp.chunks_retrieved.unwrap_or(0);
                 let secs = start.elapsed().as_secs_f64();
+                let attach_hint = if cleared_count > 0 {
+                    format!(" + {} attached doc(s)", cleared_count)
+                } else {
+                    String::new()
+                };
                 if let Some(ref sources) = resp.sources {
                     let names: Vec<&str> = sources.iter().map(|s| s.0.as_str()).collect();
                     println!(
-                        "--- {} chunks from [{}] in {:.1}s ---",
+                        "--- {} chunks from [{}]{} in {:.1}s ---",
                         chunks,
                         names.join(", "),
+                        attach_hint,
                         secs
                     );
                 } else {
-                    println!("--- {} chunks in {:.1}s ---", chunks, secs);
+                    println!("--- {} chunks{} in {:.1}s ---", chunks, attach_hint, secs);
                 }
                 // Accumulate memory only when enabled.
                 let reply = resp.answer.trim().to_string();
