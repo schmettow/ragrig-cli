@@ -13,12 +13,13 @@ use ragrig::{
     GenerationParams, HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory,
     MmrDiversityRanker, PaperResult, PrependAttach, RagAgent, RagrigError, Ranker, ScoredChunk,
     SessionId, SessionStore, SummaryHistory, Turn, TurnRole, WeightedFusionRanker,
-    collect_documents, collect_documents_with_stats, download_and_ingest_url, embed_documents,
-    search_by_document,
+    collect_documents_with_stats, search_by_document,
+    // macros
+    collect_docs, download_get, embed_docs, remove_del,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, FileHashEntry, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::documents::{HashMetadata, get_document_file_hashes, get_changed_documents, update_file_hashes};
-use ragrig::vector::{get_embeddings_file_path, remove_deleted_embeddings};
+use ragrig::vector::get_embeddings_file_path;
 use ragrig::{parsers, store};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -414,7 +415,7 @@ async fn bootstrap(
     let chunk_cfg = ChunkConfig::new(config.parse.chunk_size, config.parse.chunk_overlap)?;
     if store.is_empty() {
         info!("No existing store found. Creating new one...");
-        collect_documents(&*embedder, &doc_parsers, &config.folder, &chunk_cfg, &*store).await?;
+        collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await?;
     } else {
         info!(
             "Found existing store ({} chunks). Checking for changes...",
@@ -438,13 +439,13 @@ async fn bootstrap(
             for source in store.sources() {
                 store.delete_by_source(&source.0).await?;
             }
-            collect_documents(&*embedder, &doc_parsers, &config.folder, &chunk_cfg, &*store).await?;
+            collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await?;
         } else {
             let changed_files = get_changed_documents(&current_file_hashes, &stored_hashes);
 
             if !changed_files.is_empty() {
                 info!("Found {} changed/new files.", changed_files.len());
-                remove_deleted_embeddings(&*store, &current_file_hashes).await?;
+                remove_del!(store, current_file_hashes).await?;
                 for (_doc_type, file_name) in &changed_files {
                     store.delete_by_source(file_name).await?;
                 }
@@ -455,7 +456,7 @@ async fn bootstrap(
                         (doc_type, file_name)
                     })
                     .collect();
-                embed_documents(&*embedder, &doc_parsers, &chunk_cfg, changed_with_types, &*store)
+                embed_docs!(embedder, doc_parsers, chunk_cfg, changed_with_types, store)
                     .await?;
                 info!("Database updated.");
             } else {
@@ -779,12 +780,12 @@ impl Session {
         }
         info!("Downloading and ingesting: {} ...", url);
         debug!("URL bytes: {:?}", url.as_bytes());
-        match download_and_ingest_url(
+        match download_get!(
             self.agent.embedder(),
-            &self.doc_parsers,
-            &self.config.folder,
-            &ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
-            &self.http_client,
+            self.doc_parsers,
+            self.config.folder,
+            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
+            self.http_client,
             self.agent.store(),
             url,
             Some(DEFAULT_MAX_DOWNLOAD_BYTES),
@@ -850,12 +851,12 @@ impl Session {
 
             print!("  [{:2}] {} ... ", idx + 1, paper.title);
             stdout().flush()?;
-            match download_and_ingest_url(
+            match download_get!(
                 self.agent.embedder(),
-                &self.doc_parsers,
-                &self.config.folder,
-                &ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
-                &self.http_client,
+                self.doc_parsers,
+                self.config.folder,
+                ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
+                self.http_client,
                 self.agent.store(),
                 &url,
                 Some(DEFAULT_MAX_DOWNLOAD_BYTES),

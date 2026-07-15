@@ -28,8 +28,8 @@ kreuzberg = ["ragrig/kreuzberg"]
 all = ["ragrig/all"]
 
 [dependencies]
-ragrig = "0.9.9"
-# ragrig = { path = "../ragrig" }
+# ragrig = "0.9.10"
+ragrig = { path = "../ragrig" }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
