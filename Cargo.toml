@@ -1,6 +1,6 @@
 [package]
 name = "ragrig-cli"
-version = "0.9.9"
+version = "0.9.10"
 edition = "2024"
 description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
