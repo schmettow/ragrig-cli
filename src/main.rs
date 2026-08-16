@@ -11,9 +11,10 @@ use ragrig::{
     AttachedDocument, ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser,
     DocumentParsers, DocumentType, EmbedderSpec, EpubParserBackend, FsSessionStore,
     GenerationParams, HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory,
-    MmrDiversityRanker, PaperResult, PrependAttach, RagAgent, RagrigError, Ranker, ScoredChunk,
-    SessionId, SessionStore, SummaryHistory, Turn, TurnRole, WeightedFusionRanker,
-    collect_documents_with_stats, search_by_document,
+    MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach, RagAgent, RagrigError,
+    Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn, TurnRole,
+    WeightedFusionRanker, available_chunkers, collect_documents_with_stats,
+    scan_document_files, search_by_document,
     // macros
     collect_docs, download_get, embed_docs, remove_del,
 };
@@ -281,6 +282,7 @@ enum Command {
     Chat(String),
     Search(String),
     Embed(String),
+    Chunker(String),
     Memory(String),
     Hist(String),
     Parser(String),
@@ -392,7 +394,7 @@ async fn bootstrap(
     // Build the document parser registry (needed before store setup).
     let doc_parsers = DocumentParsers::new(filtered_parsers(&config.parse.pdf_parser, config.parse.sloppy_pdf));
     info!(
-        "Parsers: {}  |  Active PDF: {:?}  |  Chunker: markdown-structural",
+        "Parsers: {}  |  Active PDF: {:?}  |  Chunker: markdown (default; /chunker to swap)",
         doc_parsers.names().join(", "),
         config.parse.pdf_parser
     );
@@ -621,6 +623,9 @@ impl From<&str> for Command {
         if input.starts_with("/embed") {
             return Command::Embed(after("/embed").trim().to_string());
         }
+        if input.starts_with("/chunker") {
+            return Command::Chunker(after("/chunker").trim().to_string());
+        }
         if input.starts_with("/memory") {
             return Command::Memory(after("/memory").trim().to_string());
         }
@@ -689,6 +694,7 @@ impl Session {
             Command::Chat(args_str) => self.cmd_chat(&args_str).await,
             Command::Search(args) => self.cmd_search(&args).await,
             Command::Embed(args_str) => self.cmd_embed(&args_str).await,
+            Command::Chunker(args_str) => self.cmd_chunker(&args_str).await,
             Command::Memory(args_str) => self.cmd_memory(&args_str).await,
             Command::Hist(args_str) => self.cmd_hist(&args_str).await,
             Command::Prompt(args_str) => self.cmd_prompt(&args_str).await,
@@ -778,6 +784,17 @@ impl Session {
             println!("Usage: /download <url>");
             return Ok(());
         }
+        // Guard: the pipeline that would index this document must already
+        // exist in the store.  Adding to a non-indexed provenance is an error.
+        let ext = std::path::Path::new(url.split('?').next().unwrap_or(url))
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("pdf");
+        if let Err(e) = self.ensure_pipeline_indexed_for(ext, url).await {
+            error!("{e}");
+            println!("Error: {e}");
+            return Ok(());
+        }
         info!("Downloading and ingesting: {} ...", url);
         debug!("URL bytes: {:?}", url.as_bytes());
         match download_get!(
@@ -823,6 +840,14 @@ impl Session {
                 return Ok(());
             }
         };
+
+        // Guard: papers are PDFs — the (pdf parser, chunker, embedder)
+        // pipeline must already exist in the store before adding documents.
+        if let Err(e) = self.ensure_pipeline_indexed_for("pdf", "papers").await {
+            error!("{e}");
+            println!("Error: {e}");
+            return Ok(());
+        }
 
         let mut downloaded = 0;
         let mut failed = 0;
@@ -904,7 +929,8 @@ impl Session {
             "/refs [topic]   — extract references from last query results (optionally filtered by topic)"
         );
         println!("/chat <backend> [model] [api_key] | context <N> — hot-swap chat engine or adjust context window");
-        println!("/embed <backend> [model] | purge | index — hot-swap embedding backend");
+        println!("/embed <backend> [model] | purge | index — hot-swap embedding backend; index (re)builds the current pipeline");
+        println!("/chunker [name] — show or hot-swap the chunking strategy (warns when the pipeline is not indexed)");
         println!("/memory <backend> [model] [key] | transcript | log | summary | off | purge — hot-swap memory + history diffusion");
         println!("/hist [list | load <id> | delete <id>] — manage saved sessions");
         println!("/prompt chat|rewrite <file> | reset — load custom system prompts");
@@ -1523,6 +1549,9 @@ impl Session {
                 "Usage: /embed <backend> [model]  |  purge  |  index  |  topk <N>  |  threshold <F>"
             );
             println!(
+                "  index — (re)build the index for the current parser+chunker+embedder pipeline"
+            );
+            println!(
                 "  backends: {}",
                 EmbedderSpec::available_backends().join(", ")
             );
@@ -1550,7 +1579,7 @@ impl Session {
                 self.config.folder.display()
             );
             let chunk_cfg = ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
-            let stats = collect_documents_with_stats(self.agent.embedder(), &self.doc_parsers, &self.config.folder, &chunk_cfg, self.agent.store()).await?;
+            let stats = collect_documents_with_stats(self.agent.embedder(), &self.doc_parsers, self.agent.chunker(), &self.config.folder, &chunk_cfg, self.agent.store()).await?;
             info!(
                 "Re-indexing complete. Store size: {} chunks.",
                 self.agent.store().len()
@@ -1640,10 +1669,132 @@ impl Session {
                     self.agent.embedder().backend_name(),
                     self.agent.embedder().model_name()
                 );
+                // Provenance check: warn when the new embedder has no chunks
+                // in the store yet — the user must run /embed index explicitly.
+                self.pipeline_indexed().await;
             }
             Err(e) => RagrigError::log_or(&e, "Failed to build embedder"),
         }
         Ok(())
+    }
+
+    // ── /chunker [name] ──────────────────────────────────────────────
+
+    /// Show or hot-swap the chunking strategy.
+    ///
+    /// Changing the chunker does **not** re-embed automatically.  If the
+    /// resulting (parser, chunker, embedder) pipeline has no chunks in the
+    /// store yet, a warning is printed and the user must run `/embed index`
+    /// to build it.
+    async fn cmd_chunker(&mut self, args_str: &str) -> Result<()> {
+        let available = available_chunkers();
+        let name = args_str.trim();
+        if name.is_empty() {
+            println!("Chunker: {}", self.agent.chunker().name());
+            println!(
+                "Available: {}",
+                available.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
+            );
+            println!("Usage: /chunker <name>");
+            return Ok(());
+        }
+
+        let Some(new_chunker) = available
+            .into_iter()
+            .find(|c| c.name().eq_ignore_ascii_case(name))
+        else {
+            let names = available_chunkers()
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("Unknown chunker: '{}'. Available: {}", name, names);
+            return Ok(());
+        };
+
+        let old = self.agent.chunker().name();
+        self.agent.set_chunker(new_chunker);
+        info!("Chunker: {} → {}", old, self.agent.chunker().name());
+        // Provenance check: warn when the new pipeline is not indexed yet.
+        self.pipeline_indexed().await;
+        Ok(())
+    }
+
+    // ── Pipeline provenance checks ──────────────────────────────────────
+
+    /// Check whether the store already holds chunks for every
+    /// (parser, chunker, embedder) pipeline that indexing the current
+    /// document folder would produce.
+    ///
+    /// Returns `true` when every file format present in the folder has
+    /// chunks with the current provenance.  Prints a warning (but never
+    /// embeds) when some or all pipelines are missing.
+    async fn pipeline_indexed(&self) -> bool {
+        // Collect the distinct extensions present in the corpus.
+        let mut formats: Vec<String> = Vec::new();
+        for (doc, _name) in scan_document_files(&self.config.folder) {
+            if let Some(ext) = doc.path().extension().and_then(|e| e.to_str())
+                && !formats.iter().any(|f| f == ext)
+            {
+                formats.push(ext.to_string());
+            }
+        }
+
+        let embedder_id = self.agent.embedder().metadata().id();
+        let chunker = self.agent.chunker().name();
+        let mut missing: Vec<String> = Vec::new();
+        for ext in &formats {
+            let parser = self.doc_parsers.primary_name_for(ext).unwrap_or_default();
+            let filter = PipelineFilter {
+                parser: Some(parser.to_string()),
+                chunker: Some(chunker.to_string()),
+                embedder: Some(embedder_id.clone()),
+            };
+            if self.agent.store().count_matching(&filter).await == 0 {
+                missing.push(format!("{ext} ({parser})"));
+            }
+        }
+
+        if missing.is_empty() {
+            return true;
+        }
+        let msg = format!(
+            "Warning: no chunks indexed for {} with chunker={}, embedder={}. \
+             Run '/embed index' to build the index.",
+            missing.join(", "),
+            chunker,
+            embedder_id
+        );
+        warn!("{msg}");
+        println!("{msg}");
+        false
+    }
+
+    /// Guard for adding documents: the pipeline that would index the new
+    /// document must already exist in the store.
+    ///
+    /// Returns an error when no chunk with the matching
+    /// (parser, chunker, embedder) provenance exists, telling the user to
+    /// run `/embed index` first.
+    async fn ensure_pipeline_indexed_for(&self, ext: &str, what: &str) -> Result<()> {
+        let Some(parser) = self.doc_parsers.primary_name_for(ext) else {
+            anyhow::bail!("No parser registered for .{ext} files");
+        };
+        let embedder_id = self.agent.embedder().metadata().id();
+        let chunker = self.agent.chunker().name();
+        let filter = PipelineFilter {
+            parser: Some(parser.to_string()),
+            chunker: Some(chunker.to_string()),
+            embedder: Some(embedder_id.clone()),
+        };
+        if self.agent.store().count_matching(&filter).await > 0 {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Cannot add {what}: no index exists for the current pipeline \
+             (parser={parser}, chunker={chunker}, embedder={embedder_id}). \
+             Run '/embed index' first."
+        )
     }
 
     // ── /hist [list | load <id> | delete <id>] ─────────────────────
@@ -1962,6 +2113,9 @@ impl Session {
                 self.doc_parsers =
                     DocumentParsers::new(filtered_parsers(&new, self.config.parse.sloppy_pdf));
                 info!("Active parsers: {}", self.doc_parsers.names().join(", "));
+                // Provenance check: warn when the new parser has no chunks in
+                // the store yet — the user must run /embed index explicitly.
+                self.pipeline_indexed().await;
             }
             "epub" => {
                 let new = match choice.to_lowercase().as_str() {
