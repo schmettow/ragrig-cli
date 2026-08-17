@@ -464,7 +464,7 @@ If ragrig-cli reports `OllamaUnreachable`, work through these in order:
    ```
    Alternatively, install Ollama directly inside WSL.
 
-### I adjusted the context size and now Ragrig produces empty answers, or answres that clearly come from general knowledge, not the sources.
+### I adjusted the context size and now Ragrig produces empty answers, or answers that clearly come from general knowledge, not the sources.
 
 This happens, when the context size of local Ollama models exceeds the hard VRAM limits. See below for closer explanations.
 
