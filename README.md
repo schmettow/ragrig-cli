@@ -8,7 +8,7 @@ collection once, then chat with it — PDF, EPUB, DOCX, and HTML supported.
 
 **Designed for students.**  The default build compiles with zero external
 dependencies — no C++ toolchain, no `cmake`, no `protoc`.  Install Rust,
-install Ollama, run `cargo install ragrig-bin`, and you're done.
+install Ollama, run `cargo install ragrig-cli`, and you're done.
 
 > This is the **binary crate**.  If you want the library for building your
 > own application, see [`ragrig`](https://crates.io/crates/ragrig).
@@ -45,26 +45,26 @@ ollama pull qwen2.5:1.5b           # memory / query-rewriting
 ### Install
 
 ```bash
-cargo install ragrig-bin
+cargo install ragrig-cli
 ```
 
 This downloads and compiles the latest release from
-[crates.io](https://crates.io/crates/ragrig-bin).  The binary ends up in
-`~/.cargo/bin/ragrig-bin` — make sure that directory is on your `PATH`.
+[crates.io](https://crates.io/crates/ragrig-cli).  The binary ends up in
+`~/.cargo/bin/ragrig-cli` — make sure that directory is on your `PATH`.
 
 ### Or build from source
 
 ```bash
 git clone https://github.com/schmettow/ragrig
-cd ragrig-bin
+cd ragrig-cli
 cargo build --release
-./target/release/ragrig-bin --folder ~/Documents/papers
+./target/release/ragrig-cli --folder ~/Documents/papers
 ```
 
 ### Index and query
 
 ```bash
-ragrig-bin --folder ~/Documents/papers
+ragrig-cli --folder ~/Documents/papers
 ```
 
 First launch indexes all PDFs, EPUBs, DOCXs, and HTMLs in the folder.
@@ -76,6 +76,158 @@ Query > What are the key findings about forced-choice paradigms?
 
 > **Students:** if you only have Rust and Ollama installed, you already have
 > everything you need.  The default build adds nothing else.
+
+### Hybrid Search Tuning
+
+The vector store uses **Reciprocal Rank Fusion** (RRF, k=60) by default to combine
+cosine vector similarity with BM25 full-text search.  Two parameters
+control retrieval quality:
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `top_k` | 50 | Maximum chunks injected into the prompt |
+| `similarity_threshold` | 0.04 | Cosine pre‑filter — chunks with cosine < threshold are excluded from RRF fusion |
+
+**Understanding the threshold**:
+
+- The threshold operates on **cosine similarity** (range: 0.0–1.0).
+- RRF fusion produces scores in the **0.0–0.03** range (rank‑based, not
+  similarity‑based).  The trace output shows RRF scores, not cosine scores.
+- A threshold of `0.0` passes everything; `0.04` filters out chunks with
+  negligible vector overlap while letting BM25 keyword matches through.
+- Values above ~0.05 will aggressively prune — use when you have
+  high‑quality embeddings and want strictly semantic results.
+
+Tune at runtime:
+
+```
+Query > /search                      # show current values
+Query > /search topk 10              # fewer chunks, tighter context
+Query > /search threshold 0.08       # stricter semantic filter
+```
+
+### Hot-Swap Examples
+
+**Start with everything local, switch chat to cloud mid-session:**
+
+```
+Query > /chat deepseek deepseek-chat sk-...
+Chat agent swapped: Ollama (gemma2:latest) → DeepSeek (deepseek-chat)
+```
+
+**Forgetful mode — ask Alice's name, then make her forget:**
+
+```
+Query > My name is Alice
+Assistant > Nice to meet you, Alice!
+
+Query > /memory off
+Memory disabled (was: Ollama qwen2.5:1.5b)
+
+Query > What's my name?
+Assistant > I don't know — you haven't told me yet.
+```
+
+**Raw transcript — no query rewriting, test context-window pressure:**
+
+```
+Query > /memory transcript
+Memory strategy: rewrite → transcript
+
+Query > What is a vector database?
+Assistant > A vector database stores embeddings ...
+
+Query > Can you summarize that?
+# "that" is NOT rewritten — the raw transcript in the prompt
+# provides context.  Good for testing how models handle growing
+# context windows with full conversation memory appended.
+```
+
+**Session persistence — exit, restart, and recall past context:**
+
+```
+Query > What are random effects in meta-analysis?
+Assistant > Random effects models assume that the true effect size
+varies across studies, as opposed to a single fixed effect …
+
+Query > /exit
+# next day …
+
+$ ragrig --folder ~/papers
+Session: 1718400000
+
+Query > /memory log
+History diffusion: off → log
+
+Query > What was I asking about yesterday?
+# The chat prompt now includes the raw transcript of the previous
+# session, so the model can pick up the thread without you
+# repeating yourself.
+Assistant > Yesterday you asked about random effects in
+meta-analysis.  We discussed how they differ from fixed-effect
+models …
+```
+
+**Pure chat — no document search, no memory, cloud-only:**
+
+```
+Query > /embed none
+Query > /memory off
+Query > /chat deepseek deepseek-v4-pro
+Query > Explain quantum entanglement in one paragraph.
+```
+
+**Switch embeddings to CPU-only (no network):**
+
+```
+Query > /embed fastembed
+Embedder swapped: Ollama (nomic-embed-text) → Fastembed (Nomic-Embed-Text-v1.5)
+```
+
+**Experiment with ranking algorithms — same index, different retrieval:**
+
+```
+Query > /search rank Cosine
+Ranker set to Cosine.
+
+Query > /search rank BM25
+Ranker set to BM25.
+
+Query > /search rank Weighted alpha 0.7
+Ranker set to Weighted.
+
+Query > /search rank MMR lambda 0.7 inner Cosine
+Ranker set to MMR.
+
+Query > /search rank LLM inner Cosine model qwen2.5:0.5b
+LLM reranker using Ollama (qwen2.5:0.5b)
+Ranker set to LLM.
+```
+
+**Swap the chunking strategy — pipeline-aware hot-swap:**
+
+```
+Query > /chunker
+Chunker: markdown
+Available: markdown, token, chunkedrs-recursive, chunkedrs-markdown, ...
+
+Query > /chunker chunkedrs-markdown
+Chunker: markdown → chunkedrs-markdown
+Warning: no chunks indexed for pdf (unpdf), md (markdown) with
+chunker=chunkedrs-markdown, embedder=Ollama/nomic-embed-text:latest.
+Run '/embed index' to build the index.
+
+Query > /embed index      # nothing is embedded automatically — the user decides
+...
+```
+
+Every stored chunk records which (parser, chunker, embedder) pipeline built
+it.  When the chunker, parser, or embedder changes, the REPL checks whether
+the resulting pipeline already exists in the database and warns if it does
+not — but never re-embeds on its own.  Adding documents (`/download`, `/get`)
+under a pipeline that has not been indexed yet is an error.
+
+
 
 ---
 
@@ -110,7 +262,7 @@ Fine-tune generation at startup or mid-session:
 
 ```bash
 # From the command line:
-ragrig-bin --folder ~/Documents/papers --temperature 0.1 --seed 42
+ragrig-cli --folder ~/Documents/papers --temperature 0.1 --seed 42
 
 # Or hot-swap at runtime from the REPL:
 Query > /chat temperature 0.1
@@ -121,7 +273,7 @@ Query > /chat max_tokens 2048
 
 ### Runtime log levels
 
-By default ragrig-bin prints informational messages (`info` level) — agent
+By default ragrig-cli prints informational messages (`info` level) — agent
 swaps, indexing progress, and errors.  You can change the verbosity at any
 time without restarting:
 
@@ -147,7 +299,7 @@ At `trace` level the REPL logs every pipeline stage:
 The initial level can also be set via the `RUST_LOG` environment variable:
 
 ```bash
-RUST_LOG=debug ragrig-bin --folder ~/papers
+RUST_LOG=debug ragrig-cli --folder ~/papers
 ```
 
 ### Profile management
@@ -161,12 +313,12 @@ invocations.
 
 ```bash
 # Save a profile from the REPL first:
-ragrig-bin --folder ~/papers --model gemma2:latest --chunk-size 512 --top-k 20
+ragrig-cli --folder ~/papers --model gemma2:latest --chunk-size 512 --top-k 20
 > /profile save physics
 
 # Reload it later — chunk-size and top-k come from the profile,
 # but you can still override on the CLI:
-ragrig-bin --folder ~/papers --profile physics --model gemma4:e4b
+ragrig-cli --folder ~/papers --profile physics --model gemma4:e4b
 ```
 
 **In the REPL:**
@@ -186,7 +338,7 @@ hand-editable if you prefer typing values over REPL commands.
 ## CLI Flags
 
 ```
-Usage: ragrig-bin --folder <FOLDER>
+Usage: ragrig-cli --folder <FOLDER>
 
 Options:
   -f, --folder <FOLDER>            Document directory (PDFs, EPUBs, DOCXs, HTMLs)
@@ -268,7 +420,7 @@ Or use command line argument (`--embedding_model nomic-embed-text:latest`).
 
 ### Ollama is unreachable — what should I check?
 
-If ragrig-bin reports `OllamaUnreachable`, work through these in order:
+If ragrig-cli reports `OllamaUnreachable`, work through these in order:
 
 1. **Ollama isn't running.**  Start it in a terminal:
    ```bash
@@ -277,12 +429,12 @@ If ragrig-bin reports `OllamaUnreachable`, work through these in order:
    On macOS and Windows, launching the Ollama desktop app also starts the
    server.
 
-2. **Ollama is running on a non-default port.**  By default ragrig-bin connects
+2. **Ollama is running on a non-default port.**  By default ragrig-cli connects
    to `localhost:11434`.  If you changed the port (e.g. via `OLLAMA_HOST`),
    set the same variable:
    ```bash
    export OLLAMA_HOST=127.0.0.1:11435
-   ragrig-bin --folder ./my_docs
+   ragrig-cli --folder ./my_docs
    ```
 
 3. **A model pull was interrupted.**  Partial downloads can leave the Ollama
@@ -304,7 +456,7 @@ If ragrig-bin reports `OllamaUnreachable`, work through these in order:
    netstat -ano | findstr :11434
    ```
 
-5. **WSL → Windows networking.**  When Ollama runs on Windows and ragrig-bin
+5. **WSL → Windows networking.**  When Ollama runs on Windows and ragrig-cli
    runs inside WSL, `localhost` does not automatically forward.  Find the
    Windows host IP from inside WSL and set `OLLAMA_HOST`:
    ```bash
@@ -334,7 +486,7 @@ If the retry also fails, pass `--context-size-mode forced` to keep the
 original error path, then set a manual budget:
 
 ```bash
-ragrig-bin --folder ~/papers --context-tokens 4096 --context-size-mode forced
+ragrig-cli --folder ~/papers --context-tokens 4096 --context-size-mode forced
 # or mid-session:
 Query > /chat context 4096
 ```
