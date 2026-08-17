@@ -39,7 +39,7 @@ use search::{search_arxiv, search_semantic_scholar};
 struct CliChatConfig {
     #[arg(long, default_value = "ollama")]
     pub provider: String,
-    #[arg(short, long, default_value = "gemma2:latest")]
+    #[arg(short, long, default_value = "qwen3.5:9b")]
     pub model: String,
     #[arg(long, env = "DEEPSEEK_API_KEY")]
     pub deepseek_api_key: Option<String>,
@@ -53,7 +53,7 @@ struct CliChatConfig {
     pub max_tokens: Option<usize>,
     #[arg(long)]
     pub seed: Option<u64>,
-    #[arg(long, default_value = "8192")]
+    #[arg(long, default_value = "4096")]
     pub context_tokens: usize,
     #[arg(long, default_value = "auto")]
     pub context_size_mode: String,
@@ -1377,7 +1377,7 @@ impl Session {
     /// store, conversation memory, or document index.
     ///
     /// ```text
-    /// /chat ollama gemma2:latest         # switch to local model
+    /// /chat ollama qwen3.5:9b           # switch to local model
     /// /chat deepseek deepseek-chat sk-…  # switch to cloud
     /// ```
     ///

@@ -37,7 +37,7 @@ install Ollama, run `cargo install ragrig-cli`, and you're done.
 3. **Three models** (run these once):
 
 ```bash
-ollama pull gemma2:latest           # chat
+ollama pull qwen3.5:9b             # chat
 ollama pull nomic-embed-text        # embeddings
 ollama pull qwen2.5:1.5b           # memory / query-rewriting
 ```
@@ -112,7 +112,7 @@ Query > /search threshold 0.08       # stricter semantic filter
 
 ```
 Query > /chat deepseek deepseek-chat sk-...
-Chat agent swapped: Ollama (gemma2:latest) → DeepSeek (deepseek-chat)
+Chat agent swapped: Ollama (qwen3.5:9b) → DeepSeek (deepseek-chat)
 ```
 
 **Forgetful mode — ask Alice's name, then make her forget:**
@@ -292,7 +292,7 @@ At `trace` level the REPL logs every pipeline stage:
 [TRACE] Retrieved 5 chunks (cosine threshold 0.040):
 [TRACE]   [0.0164] intro.pdf — "Retrieval-Augmented Generation (RAG) is a..."
 [TRACE]   [0.0141] survey.pdf — "RAG systems have become the standard..."
-[TRACE] Context budget: 8192 tokens (~24576 chars)  |  Full prompt: 3142 chars (~1047 tokens)
+[TRACE] Context budget: 4096 tokens (~12288 chars)  |  Full prompt: 3142 chars (~1047 tokens)
 [TRACE] Elapsed: Some(1.234s)
 ```
 
@@ -313,7 +313,7 @@ invocations.
 
 ```bash
 # Save a profile from the REPL first:
-ragrig-cli --folder ~/papers --model gemma2:latest --chunk-size 512 --top-k 20
+ragrig-cli --folder ~/papers --model qwen3.5:9b --chunk-size 512 --top-k 20
 > /profile save physics
 
 # Reload it later — chunk-size and top-k come from the profile,
@@ -346,7 +346,7 @@ Options:
       --provider <PROVIDER>        Chat backend: ollama (default) or deepseek
       --deepseek-api-key <KEY>     DeepSeek API key [env: DEEPSEEK_API_KEY]
       --deepseek-model <MODEL>     DeepSeek model [default: deepseek-v4-pro]
-  -m, --model <MODEL>              Ollama chat model [default: gemma2:latest]
+  -m, --model <MODEL>              Ollama chat model [default: qwen3.5:9b]
       --embedding-provider <P>     Embedding: ollama (default) or fastembed
   -e, --embedding-model <MODEL>    Ollama embedding model [default: nomic-embed-text]
       --memory-model <MODEL>       Memory/rewrite model [default: qwen2.5:1.5b]
@@ -358,7 +358,7 @@ Options:
       --chunk-overlap <TOKENS>     Overlap between chunks [default: 128]
       --top-k <N>                  Chunks per query [default: 50]
       --similarity-threshold <FL>  Cosine similarity pre‑filter [default: 0.04]
-      --context-tokens <N>         Context window budget for prompt truncation [default: 8192]
+      --context-tokens <N>         Context window budget for prompt truncation [default: 4096]
       --context-size-mode <MODE>   Context overflow handling: auto (default) or forced
       --temperature <F>            Sampling temperature
       --top-p <F>                  Nucleus sampling top-p
@@ -441,7 +441,7 @@ If ragrig-cli reports `OllamaUnreachable`, work through these in order:
    registry in a broken state.  Re-pull the model:
    ```bash
    ollama pull nomic-embed-text
-   ollama pull gemma2:latest
+   ollama pull qwen3.5:9b
    ```
    If that fails, remove the partial model and pull fresh:
    ```bash
@@ -463,6 +463,12 @@ If ragrig-cli reports `OllamaUnreachable`, work through these in order:
    export OLLAMA_HOST=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}'):11434
    ```
    Alternatively, install Ollama directly inside WSL.
+
+### I adjusted the context size and now Ragrig produces empty answers, or answres that clearly come from general knowledge, not the sources.
+
+This happens, when the context size of local Ollama models exceeds the hard VRAM limits. See below for closer explanations.
+
+If you really need a larger context size, switch to a cloud model (or get a GPU with 24GB+ VRAM).
 
 ### When the context size exceeds the model's maximum, how can I adjust this?
 
