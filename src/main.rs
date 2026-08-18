@@ -9,12 +9,12 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 use ragrig::{
     AttachedDocument, ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser,
-    DocumentParsers, DocumentType, EmbedderSpec, EpubParserBackend, FsSessionStore,
-    GenerationParams, HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory,
-    MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach, RagAgent, RagrigError,
-    Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn, TurnRole,
-    WeightedFusionRanker, available_chunkers, collect_documents_with_stats,
-    scan_document_files, search_by_document,
+    DocumentParsers, DocumentSource, DocumentType, EmbedderSpec, EpubParserBackend, FolderSource,
+    FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory,
+    MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach, RagAgent,
+    RagrigError, Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn, TurnRole,
+    UrlSource, WeightedFusionRanker, available_chunkers, collect_documents_with_stats,
+    ingest_source, scan_document_files, search_by_document, sync_source,
     // macros
     collect_docs, download_get, embed_docs, remove_del,
 };
@@ -106,6 +106,15 @@ struct Cli {
     /// CLI overrides.  Use `/profile save <name>` in the REPL to create one.
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
+    /// Additional document sources: a named directory.  Repeatable; format
+    /// `NAME=DIR`, e.g. `--source-dir papers=/data/papers`.
+    #[arg(long = "source-dir", value_name = "NAME=DIR")]
+    pub source_dirs: Vec<String>,
+    /// Additional document sources: a named URL.  Repeatable; format
+    /// `NAME=URL`, e.g. `--source-urls arxiv=https://arxiv.org/pdf/2410.0.pdf`.
+    /// Repeating the same NAME accumulates URLs into one curated list.
+    #[arg(long = "source-urls", value_name = "NAME=URL")]
+    pub source_urls: Vec<String>,
     #[arg(long, env = "SEMANTIC_SCHOLAR_API_KEY")]
     pub semantic_scholar_api_key: Option<String>,
 
@@ -198,12 +207,26 @@ impl From<Cli> for RagrigConfig {
             embed: c.embed.into(),
             parse: c.parse.into(),
             memory: c.memory.into(),
+            source_dirs: c.source_dirs,
+            source_urls: c.source_urls,
             semantic_scholar_api_key: c.semantic_scholar_api_key,
         }
     }
 }
 
 // ── Session: carries all context between REPL cycles ──────────────────────
+
+/// A named document source registered from the command line
+/// (`--source-dir` / `--source-urls`), plus its on/off state, toggled with
+/// `/source <name> on|off`.
+#[derive(Debug)]
+struct SourceEntry {
+    name: String,
+    /// `"dir"` or `"urls"` — for display.
+    kind: &'static str,
+    source: Box<dyn DocumentSource>,
+    active: bool,
+}
 
 /// Persistent state shared across the REPL loop.
 ///
@@ -254,6 +277,9 @@ struct Session {
     /// Externally attached documents — parsed text injected into the next
     /// RAG query.  Cleared after each query (one-shot by default).
     attached_docs: Vec<AttachedDocument>,
+    /// Named document sources (`--source-dir` / `--source-urls`), toggled
+    /// with `/source <name> on|off`.
+    sources: Vec<SourceEntry>,
     /// Whether in-session transcript memory is enabled.  `false` when the
     /// user runs `/memory off` — turns are not accumulated and the
     /// transcript passed to the agent is always empty.
@@ -288,6 +314,7 @@ enum Command {
     Parser(String),
     Profile(String),
     Prompt(String),
+    Source(String),
     Log(String),
     RagQuery(String),
     Unknown(String),
@@ -338,6 +365,82 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
         }
     });
     list
+}
+
+/// Parse the `name=value` command-line source specs into document sources.
+///
+/// - `--source-dir name=path`  → a [`FolderSource`] named `name`.
+/// - `--source-urls name=url`  → adds `url` to the [`UrlSource`] named `name`;
+///   repeating a name builds one curated list.
+///
+/// Duplicate names are rejected so every source keeps a unique provenance
+/// identity in the store.  Sources start **active** and are synced into the
+/// store at startup.
+fn parse_sources(
+    source_dirs: &[String],
+    source_urls: &[String],
+    http_client: &reqwest::Client,
+) -> Result<Vec<SourceEntry>> {
+    let mut dirs: Vec<(String, FolderSource)> = Vec::new();
+    let mut urls: Vec<(String, UrlSource)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+
+    for spec in source_dirs {
+        let Some((name, dir)) = spec.split_once('=') else {
+            anyhow::bail!("Invalid --source-dir '{spec}': expected NAME=/path/to/dir");
+        };
+        let (name, dir) = (name.trim(), dir.trim());
+        if name.is_empty() || dir.is_empty() {
+            anyhow::bail!("Invalid --source-dir '{spec}': expected NAME=/path/to/dir");
+        }
+        if names.iter().any(|n| n == name) {
+            anyhow::bail!("Duplicate source name '{name}'");
+        }
+        names.push(name.to_string());
+        dirs.push((name.to_string(), FolderSource::named(name, dir)));
+    }
+
+    for spec in source_urls {
+        let Some((name, url)) = spec.split_once('=') else {
+            anyhow::bail!("Invalid --source-urls '{spec}': expected NAME=URL");
+        };
+        let (name, url) = (name.trim(), url.trim());
+        if name.is_empty() || url.is_empty() {
+            anyhow::bail!("Invalid --source-urls '{spec}': expected NAME=URL");
+        }
+        if let Some((_, source)) = urls.iter_mut().find(|(n, _)| n == name) {
+            // Repeating a name accumulates URLs into one curated list.
+            source.add_url(url);
+            continue;
+        }
+        if names.iter().any(|n| n == name) {
+            anyhow::bail!(
+                "Duplicate source name '{name}' (already a --source-dir source)"
+            );
+        }
+        names.push(name.to_string());
+        let source = UrlSource::new(name, http_client.clone())
+            .with_max_download_bytes(Some(DEFAULT_MAX_DOWNLOAD_BYTES));
+        source.add_url(url);
+        urls.push((name.to_string(), source));
+    }
+
+    let mut entries: Vec<SourceEntry> = dirs
+        .into_iter()
+        .map(|(name, source)| SourceEntry {
+            name,
+            kind: "dir",
+            source: Box::new(source),
+            active: true,
+        })
+        .collect();
+    entries.extend(urls.into_iter().map(|(name, source)| SourceEntry {
+        name,
+        kind: "urls",
+        source: Box::new(source),
+        active: true,
+    }));
+    Ok(entries)
 }
 
 async fn bootstrap(
@@ -417,7 +520,13 @@ async fn bootstrap(
     let chunk_cfg = ChunkConfig::new(config.parse.chunk_size, config.parse.chunk_overlap)?;
     if store.is_empty() {
         info!("No existing store found. Creating new one...");
-        collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await?;
+        match collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await {
+            Ok(()) => {}
+            Err(e) => {
+                // An empty main folder is fine when named sources supply documents.
+                warn!("Main folder indexing skipped: {e}");
+            }
+        }
     } else {
         info!(
             "Found existing store ({} chunks). Checking for changes...",
@@ -441,7 +550,13 @@ async fn bootstrap(
             for source in store.sources() {
                 store.delete_by_source(&source.0).await?;
             }
-            collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await?;
+            match collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await {
+                Ok(()) => {}
+                Err(e) => {
+                    // An empty main folder is fine when named sources supply documents.
+                    warn!("Main folder indexing skipped: {e}");
+                }
+            }
         } else {
             let changed_files = get_changed_documents(&current_file_hashes, &stored_hashes);
 
@@ -468,14 +583,6 @@ async fn bootstrap(
     }
 
     update_file_hashes(&current_file_hashes, &embeddings_file_path)?;
-
-    let row_count = store.len();
-    if row_count == 0 {
-        return Err(anyhow::anyhow!(ragrig::RagrigError::NoDocumentsFound {
-            folder: config.folder.to_string_lossy().into_owned(),
-        }));
-    }
-    info!("Vector store initialized with {} total entries.", row_count);
 
     // Build the rewrite (memory) agent.
     let memory_spec = ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone(), None);
@@ -508,6 +615,33 @@ async fn bootstrap(
     }
 
     let agent = agent_builder.build()?;
+
+    // ── Named document sources (--source-dir / --source-urls) ─────────
+    let http_client = reqwest::Client::new();
+    let sources = parse_sources(&config.source_dirs, &config.source_urls, &http_client)?;
+    for entry in &sources {
+        info!("Source '{}' ({}) registered.", entry.name, entry.kind);
+    }
+    for entry in sources.iter().filter(|e| e.active) {
+        info!("Indexing source '{}' ({}).", entry.name, entry.kind);
+        sync_source(
+            &*entry.source,
+            &doc_parsers,
+            agent.chunker(),
+            agent.embedder(),
+            &chunk_cfg,
+            agent.store(),
+        )
+        .await?;
+    }
+
+    let row_count = agent.store().len();
+    if row_count == 0 {
+        return Err(anyhow::anyhow!(ragrig::RagrigError::NoDocumentsFound {
+            folder: config.folder.to_string_lossy().into_owned(),
+        }));
+    }
+    info!("Vector store initialized with {} total entries.", row_count);
 
     let pdf_parser = config.parse.pdf_parser.clone();
     let context_size_forced = config.chat.context_size_mode;
@@ -544,9 +678,10 @@ async fn bootstrap(
         last_search_results: Vec::new(),
         rl,
         history_path,
-        http_client: reqwest::Client::new(),
+        http_client,
         prompt_memory: Vec::new(),
         attached_docs: Vec::new(),
+        sources,
         session_store,
         session_id,
         history_strategy: None,
@@ -641,6 +776,9 @@ impl From<&str> for Command {
         if input.starts_with("/parser") {
             return Command::Parser(after("/parser").trim().to_string());
         }
+        if input.starts_with("/source") {
+            return Command::Source(after("/source").trim().to_string());
+        }
         if input.starts_with("/profile") {
             return Command::Profile(after("/profile").trim().to_string());
         }
@@ -701,6 +839,7 @@ impl Session {
             Command::Log(args_str) => self.cmd_log(&args_str).await,
             Command::Parser(args_str) => self.cmd_parser(&args_str).await,
             Command::Profile(args_str) => self.cmd_profile(&args_str).await,
+            Command::Source(args_str) => self.cmd_source(&args_str).await,
             Command::RagQuery(q) => self.cmd_rag_query(&q).await,
             Command::Unknown(cmd) => {
                 println!("Unknown command: '{}'", cmd);
@@ -939,6 +1078,7 @@ impl Session {
             "/parser pdf unpdf|sink|extract|internal | epub epub — hot-swap parser per format"
         );
         println!("/profile save|show|load|list [name] — manage configuration profiles");
+        println!("/source <name> on|off — toggle a named document source (--source-dir / --source-urls)");
         println!("exit / quit     — end the session");
     }
 
@@ -1619,6 +1759,20 @@ impl Session {
                     }
                 }
             }
+
+            // Re-index the active named sources too (full ingest).
+            for entry in self.sources.iter().filter(|e| e.active) {
+                info!("Re-indexing source '{}' ({}).", entry.name, entry.kind);
+                ingest_source(
+                    &*entry.source,
+                    &self.doc_parsers,
+                    self.agent.chunker(),
+                    self.agent.embedder(),
+                    &chunk_cfg,
+                    self.agent.store(),
+                )
+                .await?;
+            }
             return Ok(());
         }
 
@@ -1746,6 +1900,7 @@ impl Session {
         for ext in &formats {
             let parser = self.doc_parsers.primary_name_for(ext).unwrap_or_default();
             let filter = PipelineFilter {
+                source: None,
                 parser: Some(parser.to_string()),
                 chunker: Some(chunker.to_string()),
                 embedder: Some(embedder_id.clone()),
@@ -1783,6 +1938,7 @@ impl Session {
         let embedder_id = self.agent.embedder().metadata().id();
         let chunker = self.agent.chunker().name();
         let filter = PipelineFilter {
+            source: None,
             parser: Some(parser.to_string()),
             chunker: Some(chunker.to_string()),
             embedder: Some(embedder_id.clone()),
@@ -2132,6 +2288,96 @@ impl Session {
                 println!("Unknown format: {}. Use pdf or epub.", other);
             }
         }
+        Ok(())
+    }
+
+    // ── /source [<name> [on|off]] ─────────────────────────────
+
+    /// Toggle a named document source on or off.
+    ///
+    /// - `/source`                  — list all configured sources
+    /// - `/source <name>`           — show one source's state
+    /// - `/source <name> on`        — index the source into the store (sync)
+    /// - `/source <name> off`       — remove the source's chunks from the store
+    async fn cmd_source(&mut self, args_str: &str) -> Result<()> {
+        let mut parts = args_str.split_whitespace();
+        let Some(name) = parts.next() else {
+            if self.sources.is_empty() {
+                println!(
+                    "No named sources configured. Use --source-dir NAME=DIR or \
+                     --source-urls NAME=URL."
+                );
+            } else {
+                println!("Document sources:");
+                for e in &self.sources {
+                    let state = if e.active { "on" } else { "off" };
+                    println!("  {:<16} ({:<4}) {}", e.name, e.kind, state);
+                }
+            }
+            println!("Usage: /source <name> on|off   (or /source to list)");
+            return Ok(());
+        };
+
+        match parts.next() {
+            None => match self.sources.iter().find(|e| e.name == name) {
+                Some(e) => {
+                    let state = if e.active { "on" } else { "off" };
+                    println!("Source '{}' ({}) is {}.", e.name, e.kind, state);
+                }
+                None => println!("Unknown source '{name}'. Run /source to list sources."),
+            },
+            Some("on") => self.source_on(name).await?,
+            Some("off") => self.source_off(name).await?,
+            Some(other) => println!("Usage: /source <name> on|off (got '{other}')"),
+        }
+        Ok(())
+    }
+
+    /// Enable a source: sync its documents into the store.
+    ///
+    /// Calling `on` for an already-active source re-syncs it, so documents
+    /// added to the source at runtime are picked up.
+    async fn source_on(&mut self, name: &str) -> Result<()> {
+        let Some(idx) = self.sources.iter().position(|e| e.name == name) else {
+            anyhow::bail!("Unknown source '{name}'. Run /source to list sources.");
+        };
+        if self.sources[idx].active {
+            println!("Source '{name}' is already on — syncing for changes.");
+        } else {
+            println!("Indexing source '{name}' ({})...", self.sources[idx].kind);
+        }
+        let chunk_cfg =
+            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
+        let stats = sync_source(
+            &*self.sources[idx].source,
+            &self.doc_parsers,
+            self.agent.chunker(),
+            self.agent.embedder(),
+            &chunk_cfg,
+            self.agent.store(),
+        )
+        .await?;
+        self.sources[idx].active = true;
+        println!(
+            "Source '{name}' is on ({} documents indexed; store: {} chunks).",
+            stats.len(),
+            self.agent.store().len()
+        );
+        Ok(())
+    }
+
+    /// Disable a source: remove its chunks from the store.
+    async fn source_off(&mut self, name: &str) -> Result<()> {
+        let Some(idx) = self.sources.iter().position(|e| e.name == name) else {
+            anyhow::bail!("Unknown source '{name}'. Run /source to list sources.");
+        };
+        if !self.sources[idx].active {
+            println!("Source '{name}' is already off.");
+            return Ok(());
+        }
+        self.sources[idx].active = false;
+        self.agent.store().delete_source(name).await?;
+        println!("Source '{name}' is off; its chunks were removed from the store.");
         Ok(())
     }
 
@@ -2675,6 +2921,95 @@ mod tests {
     fn parse_plain_text_is_rag_query() {
         let cmd = Command::from("What is RAG?");
         assert!(matches!(cmd, Command::RagQuery(q) if q == "What is RAG?"));
+    }
+
+    // ── /source command ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_source_no_args() {
+        let cmd = Command::from("/source");
+        assert!(matches!(cmd, Command::Source(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn parse_source_toggle() {
+        let cmd = Command::from("/source papers on");
+        assert!(matches!(cmd, Command::Source(s) if s == "papers on"));
+    }
+
+    // ── parse_sources ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_sources_dir_and_urls() {
+        let client = reqwest::Client::new();
+        let entries = parse_sources(
+            &["papers=/data/papers".to_string()],
+            &["arxiv=https://arxiv.org/pdf/a.pdf".to_string()],
+            &client,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "papers");
+        assert_eq!(entries[0].kind, "dir");
+        assert!(entries[0].active);
+        assert_eq!(entries[0].source.name(), "papers");
+        assert_eq!(entries[1].name, "arxiv");
+        assert_eq!(entries[1].kind, "urls");
+        assert!(entries[1].active);
+        assert_eq!(entries[1].source.name(), "arxiv");
+    }
+
+    #[test]
+    fn parse_sources_repeated_url_name_merges() {
+        let client = reqwest::Client::new();
+        let entries = parse_sources(
+            &[],
+            &[
+                "arxiv=https://arxiv.org/pdf/a.pdf".to_string(),
+                "arxiv=https://arxiv.org/pdf/b.pdf".to_string(),
+            ],
+            &client,
+        )
+        .unwrap();
+        // Both URLs land in one curated source, not two clashing ones.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "arxiv");
+        assert_eq!(entries[0].kind, "urls");
+        assert_eq!(entries[0].source.name(), "arxiv");
+    }
+
+    #[test]
+    fn parse_sources_duplicate_dir_name_errors() {
+        let client = reqwest::Client::new();
+        let err = parse_sources(
+            &[
+                "docs=/a".to_string(),
+                "docs=/b".to_string(),
+            ],
+            &[],
+            &client,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Duplicate source name 'docs'"));
+    }
+
+    #[test]
+    fn parse_sources_name_clash_between_kinds_errors() {
+        let client = reqwest::Client::new();
+        let err = parse_sources(
+            &["docs=/a".to_string()],
+            &["docs=https://example.com/x.pdf".to_string()],
+            &client,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Duplicate source name 'docs'"));
+    }
+
+    #[test]
+    fn parse_sources_missing_equals_errors() {
+        let client = reqwest::Client::new();
+        assert!(parse_sources(&["nodir".to_string()], &[], &client).is_err());
+        assert!(parse_sources(&[], &["nourl".to_string()], &client).is_err());
     }
 
     #[test]
