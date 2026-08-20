@@ -9,18 +9,14 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 use ragrig::{
     AttachedDocument, ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser,
-    DocumentParsers, DocumentSource, DocumentType, EmbedderSpec, EpubParserBackend, FolderSource,
-    FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory,
-    MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach, RagAgent,
-    RagrigError, Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn, TurnRole,
-    UrlSource, WeightedFusionRanker, available_chunkers, collect_documents_with_stats,
-    ingest_source, scan_document_files, search_by_document, sync_source,
-    // macros
-    collect_docs, embed_docs, remove_del,
+    DocumentParsers, DocumentSource, EmbedderSpec, EpubParserBackend, FileIndexResult,
+    FolderSource, FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker,
+    LlmReranker, LogHistory, MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach,
+    RagAgent, RagrigError, Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn,
+    TurnRole, UrlSource, WeightedFusionRanker, available_chunkers, ingest_source,
+    scan_document_files, search_by_document, sync_source,
 };
-use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, FileHashEntry, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
-use ragrig::documents::{HashMetadata, get_document_file_hashes, get_changed_documents, update_file_hashes};
-use ragrig::vector::get_embeddings_file_path;
+use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::{parsers, store};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -100,8 +96,13 @@ struct CliMemoryConfig {
 #[derive(Parser, Debug)]
 #[command(about = "Pure Rust local RAG — chunkedrs + rig + Ollama/DeepSeek/Fastembed")]
 struct Cli {
-    #[arg(short, long)]
-    pub folder: PathBuf,
+    /// Workspace directory for the vector store, history, sessions, and
+    /// profiles.  Defaults to the current directory.
+    #[arg(long = "workspace", value_name = "DIR")]
+    pub workspace: Option<PathBuf>,
+    /// Shortcut for `--workspace <DIR> --source-dir folder=<DIR>`.
+    #[arg(short, long, value_name = "DIR", conflicts_with = "workspace")]
+    pub folder: Option<PathBuf>,
     /// Load a named profile (JSON) from `.ragrig/profiles/` before applying
     /// CLI overrides.  Use `/profile save <name>` in the REPL to create one.
     #[arg(short = 'p', long)]
@@ -199,15 +200,49 @@ impl From<CliMemoryConfig> for MemoryConfig {
     }
 }
 
+/// Resolve the workspace and implicit-source handling from the CLI args:
+///
+/// - `--folder X`          → workspace X plus a `folder=X` dir source
+/// - `--workspace X`       → workspace X, no implicit source
+/// - neither, no sources   → workspace `.` plus a `folder=.` dir source
+/// - explicit sources      → workspace `.`, no implicit source
+fn resolve_workspace_and_sources(
+    folder: Option<&PathBuf>,
+    workspace: Option<&PathBuf>,
+    mut source_dirs: Vec<String>,
+    source_urls: &[String],
+) -> (PathBuf, Vec<String>) {
+    let explicit_workspace = workspace.is_some();
+    let workspace = match (folder, workspace) {
+        (Some(f), _) => f.clone(),
+        (None, Some(ws)) => ws.clone(),
+        (None, None) => PathBuf::from("."),
+    };
+    if let Some(f) = folder {
+        // --folder is sugar for --workspace <dir> --source-dir folder=<dir>.
+        source_dirs.push(format!("folder={}", f.display()));
+    } else if !explicit_workspace && source_dirs.is_empty() && source_urls.is_empty() {
+        // Bare invocation: --workspace . --source-dir folder=.
+        source_dirs.push("folder=.".to_string());
+    }
+    (workspace, source_dirs)
+}
+
 impl From<Cli> for RagrigConfig {
     fn from(c: Cli) -> Self {
+        let (workspace, source_dirs) = resolve_workspace_and_sources(
+            c.folder.as_ref(),
+            c.workspace.as_ref(),
+            c.source_dirs,
+            &c.source_urls,
+        );
         RagrigConfig {
-            folder: c.folder,
+            workspace,
             chat: c.chat.into(),
             embed: c.embed.into(),
             parse: c.parse.into(),
             memory: c.memory.into(),
-            source_dirs: c.source_dirs,
+            source_dirs,
             source_urls: c.source_urls,
             semantic_scholar_api_key: c.semantic_scholar_api_key,
         }
@@ -313,7 +348,6 @@ enum WebRoute {
 struct Session {
     config: RagrigConfig,
     agent: RagAgent,
-    embeddings_file_path: PathBuf,
     last_results: Vec<ScoredChunk>,
     last_search_results: Vec<PaperResult>,
     rl: DefaultEditor,
@@ -396,10 +430,10 @@ enum Command {
 ///
 /// 1. Builds the chat agent, embedding backend, and memory agent from
 ///    configuration via their `*Spec` factories.
-/// 2. Scans the document folder, computes file hashes, and opens or
-///    creates the vector store.
-/// 3. Incrementally indexes new or changed documents (or builds from
-///    scratch on first run).
+/// 2. Opens or creates the vector store in the workspace directory.
+/// 3. Parses the named document sources (`--source-dir` / `--source-urls`,
+///    plus the implicit `folder` source from `--folder` or the bare default)
+///    and syncs each active one into the store.
 /// 4. Constructs a [`Session`] carrying all state needed by the REPL.
 ///
 /// This is the only place where the full pipeline is assembled —
@@ -559,8 +593,6 @@ async fn bootstrap(
         embedder.model_name()
     );
 
-    let embeddings_file_path = get_embeddings_file_path(&config.folder);
-
     // Build the document parser registry (needed before store setup).
     let doc_parsers = DocumentParsers::new(filtered_parsers(&config.parse.pdf_parser, config.parse.sloppy_pdf));
     info!(
@@ -569,87 +601,11 @@ async fn bootstrap(
         config.parse.pdf_parser
     );
 
-    let current_file_hashes = match get_document_file_hashes(&config.folder) {
-        Ok(hashes) => {
-            info!("Found {} document files with hashes.", hashes.len());
-            hashes
-        }
-        Err(e) => {
-            warn!("Could not compute file hashes: {}", e);
-            Vec::new()
-        }
-    };
-
-    // Open or create the vector store.
-    let store = store::open_store(&config.folder).await?;
-
-    // Determine whether we need to build from scratch or update incrementally.
+    // Open or create the vector store in the workspace.  Documents come
+    // exclusively from the named sources; the workspace is state only.
+    info!("Workspace: {}", config.workspace.display());
+    let store = store::open_store(&config.workspace).await?;
     let chunk_cfg = ChunkConfig::new(config.parse.chunk_size, config.parse.chunk_overlap)?;
-    if store.is_empty() {
-        info!("No existing store found. Creating new one...");
-        match collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await {
-            Ok(()) => {}
-            Err(e) => {
-                // An empty main folder is fine when named sources supply documents.
-                warn!("Main folder indexing skipped: {e}");
-            }
-        }
-    } else {
-        info!(
-            "Found existing store ({} chunks). Checking for changes...",
-            store.len()
-        );
-
-        let mut stored_hashes: Vec<FileHashEntry> = Vec::new();
-        if embeddings_file_path.exists() {
-            match fs::read_to_string(&embeddings_file_path) {
-                Ok(json) => {
-                    if let Ok(metadata) = serde_json::from_str::<HashMetadata>(&json) {
-                        stored_hashes = metadata.file_hashes;
-                    }
-                }
-                Err(e) => warn!("Could not read hash metadata: {}", e),
-            }
-        }
-
-        if stored_hashes.is_empty() {
-            info!("No hash metadata found. Regenerating all embeddings...");
-            for source in store.sources() {
-                store.delete_by_source(&source.0).await?;
-            }
-            match collect_docs!(embedder, doc_parsers, config.folder, chunk_cfg, store).await {
-                Ok(()) => {}
-                Err(e) => {
-                    // An empty main folder is fine when named sources supply documents.
-                    warn!("Main folder indexing skipped: {e}");
-                }
-            }
-        } else {
-            let changed_files = get_changed_documents(&current_file_hashes, &stored_hashes);
-
-            if !changed_files.is_empty() {
-                info!("Found {} changed/new files.", changed_files.len());
-                remove_del!(store, current_file_hashes).await?;
-                for (_doc_type, file_name) in &changed_files {
-                    store.delete_by_source(file_name).await?;
-                }
-                let changed_with_types: Vec<(DocumentType, String)> = changed_files
-                    .into_iter()
-                    .map(|(doc_type, _)| {
-                        let file_name = doc_type.file_name().to_string();
-                        (doc_type, file_name)
-                    })
-                    .collect();
-                embed_docs!(embedder, doc_parsers, chunk_cfg, changed_with_types, store)
-                    .await?;
-                info!("Database updated.");
-            } else {
-                info!("No files have changed. Using existing embeddings.");
-            }
-        }
-    }
-
-    update_file_hashes(&current_file_hashes, &embeddings_file_path)?;
 
     // Build the rewrite (memory) agent.
     let memory_spec = ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone(), None);
@@ -705,7 +661,7 @@ async fn bootstrap(
     let row_count = agent.store().len();
     if row_count == 0 {
         return Err(anyhow::anyhow!(ragrig::RagrigError::NoDocumentsFound {
-            folder: config.folder.to_string_lossy().into_owned(),
+            folder: config.workspace.to_string_lossy().into_owned(),
         }));
     }
     info!("Vector store initialized with {} total entries.", row_count);
@@ -714,7 +670,7 @@ async fn bootstrap(
     let context_size_forced = config.chat.context_size_mode;
 
     let mut rl = DefaultEditor::new()?;
-    let history_path = config.folder.join(".ragrig_history");
+    let history_path = config.workspace.join(".ragrig_history");
     if history_path.exists()
         && let Err(e) = rl.load_history(&history_path) {
             warn!("Could not load history: {}", e);
@@ -726,7 +682,7 @@ async fn bootstrap(
     );
 
     // ── Session store (filesystem‑backed, one JSON file per session) ──
-    let sessions_dir = config.folder.join(".ragrig").join("sessions");
+    let sessions_dir = config.workspace.join(".ragrig").join("sessions");
     let session_store: Box<dyn SessionStore> =
         Box::new(FsSessionStore::new(sessions_dir)?);
     let session_id = SessionId(
@@ -740,7 +696,6 @@ async fn bootstrap(
     Ok(Session {
         config,
         agent,
-        embeddings_file_path,
         last_results: Vec::new(),
         last_search_results: Vec::new(),
         rl,
@@ -1043,7 +998,7 @@ impl Session {
                 ragrig::download_and_ingest_url_with_chunker(
                     self.agent.embedder(),
                     &self.doc_parsers,
-                    &self.config.folder,
+                    &self.config.workspace,
                     &chunk_cfg,
                     &self.http_client,
                     self.agent.store(),
@@ -1077,14 +1032,6 @@ impl Session {
         match self.ingest_web_url(url).await {
             Ok(summary) => {
                 println!("{summary}");
-                // The main folder's hash bookkeeping only applies when the
-                // document landed there (dyn off / no active sources).
-                if matches!(self.choose_web_route(), WebRoute::Folder) {
-                    update_file_hashes(
-                        &get_document_file_hashes(&self.config.folder).unwrap_or_default(),
-                        &self.embeddings_file_path,
-                    )?;
-                }
             }
             Err(e) => RagrigError::log_or(&e, "Download failed"),
         }
@@ -1150,14 +1097,6 @@ impl Session {
                 Ok(summary) => {
                     println!("done — {summary}");
                     downloaded += 1;
-                    // The main folder's hash bookkeeping only applies when the
-                    // document landed there (dyn off / no active sources).
-                    if matches!(self.choose_web_route(), WebRoute::Folder) {
-                        update_file_hashes(
-                            &get_document_file_hashes(&self.config.folder).unwrap_or_default(),
-                            &self.embeddings_file_path,
-                        )?;
-                    }
                 }
                 Err(e) => {
                     error!("Paper download failed: {}", e);
@@ -1838,17 +1777,31 @@ impl Session {
         }
 
         if backend.eq_ignore_ascii_case("index") {
-            info!(
-                "Re-indexing all documents in {}...",
-                self.config.folder.display()
-            );
-            let chunk_cfg = ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
-            let stats = collect_documents_with_stats(self.agent.embedder(), &self.doc_parsers, self.agent.chunker(), &self.config.folder, &chunk_cfg, self.agent.store()).await?;
+            info!("Re-indexing all active document sources...");
+            let chunk_cfg =
+                ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
+
+            // Full re-ingest of every active source, stats aggregated.
+            let mut all_stats: Vec<FileIndexResult> = Vec::new();
+            for entry in self.sources.iter().filter(|e| e.active) {
+                info!("Re-indexing source '{}' ({}).", entry.name, entry.kind.label());
+                let stats = ingest_source(
+                    entry.as_source(),
+                    &self.doc_parsers,
+                    self.agent.chunker(),
+                    self.agent.embedder(),
+                    &chunk_cfg,
+                    self.agent.store(),
+                )
+                .await?;
+                all_stats.extend(stats);
+            }
             info!(
                 "Re-indexing complete. Store size: {} chunks.",
                 self.agent.store().len()
             );
-            // Print per-file result table.
+            // Print the aggregated per-file result table.
+            let stats = &all_stats;
             let ok_count = stats.iter().filter(|s| s.ok).count();
             let fail_count = stats.len() - ok_count;
             let total_chunks: usize = stats.iter().map(|s| s.chunks).sum();
@@ -1864,7 +1817,7 @@ impl Session {
                     "File", "KB", "Chunks", "Chars", "Avg/Ch"
                 );
                 println!("{}", "─".repeat(78));
-                for s in &stats {
+                for s in stats {
                     let name = if s.file_name.0.len() > 42 {
                         format!("{}…", &s.file_name.0[..41])
                     } else {
@@ -1882,20 +1835,6 @@ impl Session {
                         );
                     }
                 }
-            }
-
-            // Re-index the active named sources too (full ingest).
-            for entry in self.sources.iter().filter(|e| e.active) {
-                info!("Re-indexing source '{}' ({}).", entry.name, entry.kind.label());
-                ingest_source(
-                    entry.as_source(),
-                    &self.doc_parsers,
-                    self.agent.chunker(),
-                    self.agent.embedder(),
-                    &chunk_cfg,
-                    self.agent.store(),
-                )
-                .await?;
             }
             return Ok(());
         }
@@ -2008,13 +1947,18 @@ impl Session {
     /// chunks with the current provenance.  Prints a warning (but never
     /// embeds) when some or all pipelines are missing.
     async fn pipeline_indexed(&self) -> bool {
-        // Collect the distinct extensions present in the corpus.
+        // Collect the distinct extensions present in the active directory
+        // sources' corpora.
         let mut formats: Vec<String> = Vec::new();
-        for (doc, _name) in scan_document_files(&self.config.folder) {
-            if let Some(ext) = doc.path().extension().and_then(|e| e.to_str())
-                && !formats.iter().any(|f| f == ext)
-            {
-                formats.push(ext.to_string());
+        for entry in self.sources.iter().filter(|e| e.active) {
+            if let SourceKind::Dir(folder) = &entry.kind {
+                for (doc, _name) in scan_document_files(folder.folder()) {
+                    if let Some(ext) = doc.path().extension().and_then(|e| e.to_str())
+                        && !formats.iter().any(|f| f == ext)
+                    {
+                        formats.push(ext.to_string());
+                    }
+                }
             }
         }
 
@@ -2548,7 +2492,7 @@ impl Session {
 
         match sub {
             "" | "list" => {
-                let profiles = RagrigConfig::list_profiles(&self.config.folder)?;
+                let profiles = RagrigConfig::list_profiles(&self.config.workspace)?;
                 if profiles.is_empty() {
                     println!("No saved profiles. Use /profile save <name> to create one.");
                 } else {
@@ -2570,17 +2514,17 @@ impl Session {
                 // Update the in-memory config from the running agent state
                 // before saving, so the profile reflects current runtime settings.
                 self.sync_config_from_agent();
-                self.config.save_to_profile(&self.config.folder, name)?;
+                self.config.save_to_profile(&self.config.workspace, name)?;
                                 println!("Profile '{}' saved.", name);
             }
             "show" => {
                 let config = if name == "current" || parts.next().is_none() && name == "default"
-                    && RagrigConfig::list_profiles(&self.config.folder)?.is_empty()
+                    && RagrigConfig::list_profiles(&self.config.workspace)?.is_empty()
                 {
                     self.sync_config_from_agent();
                     self.config.clone()
                 } else {
-                    match RagrigConfig::load_from_profile(&self.config.folder, name) {
+                    match RagrigConfig::load_from_profile(&self.config.workspace, name) {
                         Ok(c) => c,
                         Err(e) => {
                             // Try showing the current in-memory config if named profile not found.
@@ -2597,11 +2541,11 @@ impl Session {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             }
             "load" => {
-                let profile = RagrigConfig::load_from_profile(&self.config.folder, name)?;
-                // Keep the current folder — profiles don't override it.
-                let folder = self.config.folder.clone();
+                let profile = RagrigConfig::load_from_profile(&self.config.workspace, name)?;
+                // Keep the current workspace — profiles don't override it.
+                let workspace = self.config.workspace.clone();
                 self.config = profile;
-                self.config.folder = folder;
+                self.config.workspace = workspace;
                 println!("Profile '{}' loaded. Use /chat, /embed, /memory to apply.", name);
                 info!(
                     "Loaded profile '{}': chat={} embed={} memory={}",
@@ -2868,7 +2812,7 @@ async fn main() -> Result<()> {
 
     // If --profile was given, load it and merge CLI overrides on top.
     let config = if let Some(ref name) = profile_name {
-        match RagrigConfig::load_from_profile(&cli_config.folder, name) {
+        match RagrigConfig::load_from_profile(&cli_config.workspace, name) {
             Ok(mut profile) => {
                 profile.override_with(&cli_config);
                 info!("Loaded profile '{}' with CLI overrides applied.", name);
@@ -2885,7 +2829,7 @@ async fn main() -> Result<()> {
     };
 
     // ── File logging (always debug level, daily rotation) ───────────
-    let log_dir = config.folder.join(".ragrig");
+    let log_dir = config.workspace.join(".ragrig");
     let _ = std::fs::create_dir_all(&log_dir);
     let file_appender = rolling::daily(&log_dir, "ragrig.log");
     let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
@@ -3166,6 +3110,51 @@ mod tests {
         assert!(parse_sources(&[], &["nourl".to_string()], &client).is_err());
     }
 
+    // ── resolve_workspace_and_sources (--folder / --workspace) ──────
+
+    #[test]
+    fn resolve_folder_is_workspace_plus_source() {
+        let (ws, dirs) = resolve_workspace_and_sources(
+            Some(&PathBuf::from("/data/docs")),
+            None,
+            vec![],
+            &[],
+        );
+        assert_eq!(ws, PathBuf::from("/data/docs"));
+        assert_eq!(dirs, vec!["folder=/data/docs".to_string()]);
+    }
+
+    #[test]
+    fn resolve_workspace_alone_has_no_implicit_source() {
+        let (ws, dirs) = resolve_workspace_and_sources(
+            None,
+            Some(&PathBuf::from("/data/ws")),
+            vec![],
+            &[],
+        );
+        assert_eq!(ws, PathBuf::from("/data/ws"));
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn resolve_bare_invocation_defaults_to_cwd() {
+        let (ws, dirs) = resolve_workspace_and_sources(None, None, vec![], &[]);
+        assert_eq!(ws, PathBuf::from("."));
+        assert_eq!(dirs, vec!["folder=.".to_string()]);
+    }
+
+    #[test]
+    fn resolve_explicit_sources_suppress_implicit_dir() {
+        let (ws, dirs) = resolve_workspace_and_sources(
+            None,
+            None,
+            vec![],
+            &["arxiv=https://arxiv.org/pdf/a.pdf".to_string()],
+        );
+        assert_eq!(ws, PathBuf::from("."));
+        assert!(dirs.is_empty());
+    }
+
     // ── pick_web_route (dyn routing rules) ─────────────────────────────
 
     fn dir_entry(name: &str) -> SourceEntry {
@@ -3297,7 +3286,10 @@ mod tests {
         let log_level = Arc::new(RwLock::new("warn".into()));
 
         let config = RagrigConfig {
-            folder: "tests/fixtures/formats/pdf".into(),
+            workspace: "tests/fixtures/formats/pdf".into(),
+            // Equivalent to the old `--folder` shortcut: the workspace is
+            // state-only; documents come from named sources.
+            source_dirs: vec!["folder=tests/fixtures/formats/pdf".to_string()],
             chat: ChatConfig {
                 model: "gemma4:e4b".into(),
                 ..Default::default()
