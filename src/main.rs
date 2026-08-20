@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
 use std::sync::{Arc, RwLock};
@@ -16,7 +16,7 @@ use ragrig::{
     UrlSource, WeightedFusionRanker, available_chunkers, collect_documents_with_stats,
     ingest_source, scan_document_files, search_by_document, sync_source,
     // macros
-    collect_docs, download_get, embed_docs, remove_del,
+    collect_docs, embed_docs, remove_del,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, FileHashEntry, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::documents::{HashMetadata, get_document_file_hashes, get_changed_documents, update_file_hashes};
@@ -214,18 +214,82 @@ impl From<Cli> for RagrigConfig {
     }
 }
 
+/// Choose the web-download destination: `dyn` on → first active URL source,
+/// else first active directory source; `dyn` off or no active named sources
+/// → the main folder (legacy behaviour).
+fn pick_web_route(dyn_sources: bool, sources: &[SourceEntry]) -> WebRoute {
+    if dyn_sources {
+        if let Some(e) = sources
+            .iter()
+            .find(|e| e.active && matches!(&e.kind, SourceKind::Urls(_)))
+        {
+            return WebRoute::Url {
+                name: e.name.clone(),
+            };
+        }
+        if let Some(e) = sources
+            .iter()
+            .find(|e| e.active && matches!(&e.kind, SourceKind::Dir(_)))
+        {
+            return WebRoute::Dir {
+                name: e.name.clone(),
+            };
+        }
+    }
+    WebRoute::Folder
+}
+
 // ── Session: carries all context between REPL cycles ──────────────────────
+
+/// Concrete kind of a named document source.  Kept concrete (rather than
+/// `Box<dyn DocumentSource>` alone) so the REPL can call type-specific
+/// methods: `UrlSource::add_url` for dynamic routing and
+/// `FolderSource::folder` for saving downloads into a directory source.
+#[derive(Debug, Clone)]
+enum SourceKind {
+    Dir(FolderSource),
+    Urls(UrlSource),
+}
+
+impl SourceKind {
+    /// `"dir"` or `"urls"` — for display.
+    fn label(&self) -> &'static str {
+        match self {
+            SourceKind::Dir(_) => "dir",
+            SourceKind::Urls(_) => "urls",
+        }
+    }
+}
 
 /// A named document source registered from the command line
 /// (`--source-dir` / `--source-urls`), plus its on/off state, toggled with
 /// `/source <name> on|off`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SourceEntry {
     name: String,
-    /// `"dir"` or `"urls"` — for display.
-    kind: &'static str,
-    source: Box<dyn DocumentSource>,
+    kind: SourceKind,
     active: bool,
+}
+
+impl SourceEntry {
+    /// The source as a trait object, for ingestion.
+    fn as_source(&self) -> &dyn DocumentSource {
+        match &self.kind {
+            SourceKind::Dir(folder) => folder,
+            SourceKind::Urls(urls) => urls,
+        }
+    }
+}
+
+/// Where a runtime web download is routed by the `dyn` rules.
+#[derive(Debug)]
+enum WebRoute {
+    /// First active URL source: the URL joins its curated list.
+    Url { name: String },
+    /// First active directory source: the file is saved into its directory.
+    Dir { name: String },
+    /// Main folder (legacy behaviour; also when `dyn` is off).
+    Folder,
 }
 
 /// Persistent state shared across the REPL loop.
@@ -280,6 +344,11 @@ struct Session {
     /// Named document sources (`--source-dir` / `--source-urls`), toggled
     /// with `/source <name> on|off`.
     sources: Vec<SourceEntry>,
+    /// Dynamic routing for web downloads (`/source dyn on|off`).  When on,
+    /// `/download` and `/get` route documents into the first active URL
+    /// source (else the first active directory source) instead of the main
+    /// folder.
+    dyn_sources: bool,
     /// Whether in-session transcript memory is enabled.  `false` when the
     /// user runs `/memory off` — turns are not accumulated and the
     /// transcript passed to the agent is always empty.
@@ -429,15 +498,13 @@ fn parse_sources(
         .into_iter()
         .map(|(name, source)| SourceEntry {
             name,
-            kind: "dir",
-            source: Box::new(source),
+            kind: SourceKind::Dir(source),
             active: true,
         })
         .collect();
     entries.extend(urls.into_iter().map(|(name, source)| SourceEntry {
         name,
-        kind: "urls",
-        source: Box::new(source),
+        kind: SourceKind::Urls(source),
         active: true,
     }));
     Ok(entries)
@@ -620,12 +687,12 @@ async fn bootstrap(
     let http_client = reqwest::Client::new();
     let sources = parse_sources(&config.source_dirs, &config.source_urls, &http_client)?;
     for entry in &sources {
-        info!("Source '{}' ({}) registered.", entry.name, entry.kind);
+        info!("Source '{}' ({}) registered.", entry.name, entry.kind.label());
     }
     for entry in sources.iter().filter(|e| e.active) {
-        info!("Indexing source '{}' ({}).", entry.name, entry.kind);
+        info!("Indexing source '{}' ({}).", entry.name, entry.kind.label());
         sync_source(
-            &*entry.source,
+            entry.as_source(),
             &doc_parsers,
             agent.chunker(),
             agent.embedder(),
@@ -682,6 +749,7 @@ async fn bootstrap(
         prompt_memory: Vec::new(),
         attached_docs: Vec::new(),
         sources,
+        dyn_sources: true,
         session_store,
         session_id,
         history_strategy: None,
@@ -918,6 +986,76 @@ impl Session {
 
     // ── /download <url> ───────────────────────────────────────────────
 
+    /// Choose the destination for a runtime web download:
+    /// `dyn` on → first active URL source, else first active directory
+    /// source; `dyn` off or no active sources → main folder.
+    fn choose_web_route(&self) -> WebRoute {
+        pick_web_route(self.dyn_sources, &self.sources)
+    }
+
+    /// Download and index one web document, routed by the `dyn` rules.
+    /// Returns a human-readable summary of where it went.
+    async fn ingest_web_url(&mut self, url: &str) -> Result<String> {
+        let chunk_cfg =
+            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
+        match self.choose_web_route() {
+            WebRoute::Url { name } => {
+                let idx = self
+                    .sources
+                    .iter()
+                    .position(|e| e.name == name)
+                    .expect("route chose an existing source");
+                match &self.sources[idx].kind {
+                    SourceKind::Urls(source) => source.add_url(url),
+                    SourceKind::Dir(_) => unreachable!("route chose a URL source"),
+                }
+                let indexed = self.sync_source_entry(idx).await?;
+                Ok(format!(
+                    "Added '{url}' to URL source '{name}' ({indexed} documents indexed)."
+                ))
+            }
+            WebRoute::Dir { name } => {
+                let idx = self
+                    .sources
+                    .iter()
+                    .position(|e| e.name == name)
+                    .expect("route chose an existing source");
+                let folder = match &self.sources[idx].kind {
+                    SourceKind::Dir(source) => source.folder().to_path_buf(),
+                    SourceKind::Urls(_) => unreachable!("route chose a directory source"),
+                };
+                let (bytes, filename, _content_type) =
+                    ragrig::fetch_url(&self.http_client, url, Some(DEFAULT_MAX_DOWNLOAD_BYTES))
+                        .await?;
+                let dest = folder.join(&filename);
+                std::fs::write(&dest, &bytes).with_context(|| {
+                    format!("failed to save '{}' into dir source '{name}'", dest.display())
+                })?;
+                let indexed = self.sync_source_entry(idx).await?;
+                Ok(format!(
+                    "Saved '{filename}' into dir source '{name}' ({indexed} documents indexed)."
+                ))
+            }
+            WebRoute::Folder => {
+                if self.dyn_sources && !self.sources.is_empty() {
+                    println!("Note: no active named sources — adding to the main folder.");
+                }
+                ragrig::download_and_ingest_url_with_chunker(
+                    self.agent.embedder(),
+                    &self.doc_parsers,
+                    &self.config.folder,
+                    &chunk_cfg,
+                    &self.http_client,
+                    self.agent.store(),
+                    url,
+                    Some(DEFAULT_MAX_DOWNLOAD_BYTES),
+                    self.agent.chunker(),
+                )
+                .await
+            }
+        }
+    }
+
     async fn cmd_download(&mut self, url: &str) -> Result<()> {
         if url.is_empty() {
             println!("Usage: /download <url>");
@@ -936,24 +1074,17 @@ impl Session {
         }
         info!("Downloading and ingesting: {} ...", url);
         debug!("URL bytes: {:?}", url.as_bytes());
-        match download_get!(
-            self.agent.embedder(),
-            self.doc_parsers,
-            self.config.folder,
-            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
-            self.http_client,
-            self.agent.store(),
-            url,
-            Some(DEFAULT_MAX_DOWNLOAD_BYTES),
-        )
-        .await
-        {
+        match self.ingest_web_url(url).await {
             Ok(summary) => {
-                println!("{}", summary);
-                update_file_hashes(
-                    &get_document_file_hashes(&self.config.folder).unwrap_or_default(),
-                    &self.embeddings_file_path,
-                )?;
+                println!("{summary}");
+                // The main folder's hash bookkeeping only applies when the
+                // document landed there (dyn off / no active sources).
+                if matches!(self.choose_web_route(), WebRoute::Folder) {
+                    update_file_hashes(
+                        &get_document_file_hashes(&self.config.folder).unwrap_or_default(),
+                        &self.embeddings_file_path,
+                    )?;
+                }
             }
             Err(e) => RagrigError::log_or(&e, "Download failed"),
         }
@@ -1015,25 +1146,18 @@ impl Session {
 
             print!("  [{:2}] {} ... ", idx + 1, paper.title);
             stdout().flush()?;
-            match download_get!(
-                self.agent.embedder(),
-                self.doc_parsers,
-                self.config.folder,
-                ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?,
-                self.http_client,
-                self.agent.store(),
-                &url,
-                Some(DEFAULT_MAX_DOWNLOAD_BYTES),
-            )
-            .await
-            {
-                Ok(_) => {
-                    println!("done");
+            match self.ingest_web_url(&url).await {
+                Ok(summary) => {
+                    println!("done — {summary}");
                     downloaded += 1;
-                    update_file_hashes(
-                        &get_document_file_hashes(&self.config.folder).unwrap_or_default(),
-                        &self.embeddings_file_path,
-                    )?;
+                    // The main folder's hash bookkeeping only applies when the
+                    // document landed there (dyn off / no active sources).
+                    if matches!(self.choose_web_route(), WebRoute::Folder) {
+                        update_file_hashes(
+                            &get_document_file_hashes(&self.config.folder).unwrap_or_default(),
+                            &self.embeddings_file_path,
+                        )?;
+                    }
                 }
                 Err(e) => {
                     error!("Paper download failed: {}", e);
@@ -1059,7 +1183,7 @@ impl Session {
         println!("/attach <file>  — attach a document for the next query (one-shot, not indexed)");
         println!("/attach         — show currently attached files");
         println!("/attach clear   — clear all attachments");
-        println!("/download <url>  — download and ingest a PDF into the document pool");
+        println!("/download <url>  — download and ingest a PDF (dyn routing: first active URL source, else first active dir source)");
         println!("/scholar <q>   — search Semantic Scholar (free API key for higher limits)");
         println!("/arxiv <q>      — search arXiv (no API key needed, no rate limits)");
         println!("/search         — show / adjust search parameters (topk, threshold, rank, by)");
@@ -1078,7 +1202,7 @@ impl Session {
             "/parser pdf unpdf|sink|extract|internal | epub epub — hot-swap parser per format"
         );
         println!("/profile save|show|load|list [name] — manage configuration profiles");
-        println!("/source <name> on|off — toggle a named document source (--source-dir / --source-urls)");
+        println!("/source <name> on|off — toggle a named document source (--source-dir / --source-urls); /source dyn on|off — dynamic web-download routing");
         println!("exit / quit     — end the session");
     }
 
@@ -1762,9 +1886,9 @@ impl Session {
 
             // Re-index the active named sources too (full ingest).
             for entry in self.sources.iter().filter(|e| e.active) {
-                info!("Re-indexing source '{}' ({}).", entry.name, entry.kind);
+                info!("Re-indexing source '{}' ({}).", entry.name, entry.kind.label());
                 ingest_source(
-                    &*entry.source,
+                    entry.as_source(),
                     &self.doc_parsers,
                     self.agent.chunker(),
                     self.agent.embedder(),
@@ -2293,12 +2417,13 @@ impl Session {
 
     // ── /source [<name> [on|off]] ─────────────────────────────
 
-    /// Toggle a named document source on or off.
+    /// Toggle a named document source on or off, or control dynamic routing.
     ///
-    /// - `/source`                  — list all configured sources
+    /// - `/source`                  — list all configured sources + the `dyn` route
     /// - `/source <name>`           — show one source's state
     /// - `/source <name> on`        — index the source into the store (sync)
     /// - `/source <name> off`       — remove the source's chunks from the store
+    /// - `/source dyn on|off`       — toggle dynamic routing for web downloads
     async fn cmd_source(&mut self, args_str: &str) -> Result<()> {
         let mut parts = args_str.split_whitespace();
         let Some(name) = parts.next() else {
@@ -2311,18 +2436,40 @@ impl Session {
                 println!("Document sources:");
                 for e in &self.sources {
                     let state = if e.active { "on" } else { "off" };
-                    println!("  {:<16} ({:<4}) {}", e.name, e.kind, state);
+                    println!("  {:<16} ({:<4}) {}", e.name, e.kind.label(), state);
                 }
             }
+            let state = if self.dyn_sources { "on" } else { "off" };
+            println!("  {:<16} ({:<4}) {}", "dyn", "route", state);
             println!("Usage: /source <name> on|off   (or /source to list)");
             return Ok(());
         };
+
+        // `dyn` is the virtual dynamic-routing entry, not a real source.
+        if name == "dyn" {
+            match parts.next() {
+                None => {
+                    let state = if self.dyn_sources { "on" } else { "off" };
+                    println!("Dynamic routing (dyn) is {state}: /download and /get route into the first active URL source, else the first active directory source.");
+                }
+                Some("on") => {
+                    self.dyn_sources = true;
+                    println!("Dynamic routing is on — web downloads go to the first active URL source (else the first active directory source).");
+                }
+                Some("off") => {
+                    self.dyn_sources = false;
+                    println!("Dynamic routing is off — web downloads go to the main folder.");
+                }
+                Some(other) => println!("Usage: /source dyn on|off (got '{other}')"),
+            }
+            return Ok(());
+        }
 
         match parts.next() {
             None => match self.sources.iter().find(|e| e.name == name) {
                 Some(e) => {
                     let state = if e.active { "on" } else { "off" };
-                    println!("Source '{}' ({}) is {}.", e.name, e.kind, state);
+                    println!("Source '{}' ({}) is {}", e.name, e.kind.label(), state);
                 }
                 None => println!("Unknown source '{name}'. Run /source to list sources."),
             },
@@ -2331,6 +2478,23 @@ impl Session {
             Some(other) => println!("Usage: /source <name> on|off (got '{other}')"),
         }
         Ok(())
+    }
+
+    /// Sync one named source into the store with the current pipeline.
+    /// Returns the number of documents indexed.
+    async fn sync_source_entry(&mut self, idx: usize) -> Result<usize> {
+        let chunk_cfg =
+            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
+        let stats = sync_source(
+            self.sources[idx].as_source(),
+            &self.doc_parsers,
+            self.agent.chunker(),
+            self.agent.embedder(),
+            &chunk_cfg,
+            self.agent.store(),
+        )
+        .await?;
+        Ok(stats.len())
     }
 
     /// Enable a source: sync its documents into the store.
@@ -2344,23 +2508,13 @@ impl Session {
         if self.sources[idx].active {
             println!("Source '{name}' is already on — syncing for changes.");
         } else {
-            println!("Indexing source '{name}' ({})...", self.sources[idx].kind);
+            println!("Indexing source '{name}' ({})...", self.sources[idx].kind.label());
         }
-        let chunk_cfg =
-            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
-        let stats = sync_source(
-            &*self.sources[idx].source,
-            &self.doc_parsers,
-            self.agent.chunker(),
-            self.agent.embedder(),
-            &chunk_cfg,
-            self.agent.store(),
-        )
-        .await?;
+        let indexed = self.sync_source_entry(idx).await?;
         self.sources[idx].active = true;
         println!(
             "Source '{name}' is on ({} documents indexed; store: {} chunks).",
-            stats.len(),
+            indexed,
             self.agent.store().len()
         );
         Ok(())
@@ -2950,13 +3104,13 @@ mod tests {
         .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "papers");
-        assert_eq!(entries[0].kind, "dir");
+        assert_eq!(entries[0].kind.label(), "dir");
         assert!(entries[0].active);
-        assert_eq!(entries[0].source.name(), "papers");
+        assert_eq!(entries[0].as_source().name(), "papers");
         assert_eq!(entries[1].name, "arxiv");
-        assert_eq!(entries[1].kind, "urls");
+        assert_eq!(entries[1].kind.label(), "urls");
         assert!(entries[1].active);
-        assert_eq!(entries[1].source.name(), "arxiv");
+        assert_eq!(entries[1].as_source().name(), "arxiv");
     }
 
     #[test]
@@ -2974,8 +3128,8 @@ mod tests {
         // Both URLs land in one curated source, not two clashing ones.
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "arxiv");
-        assert_eq!(entries[0].kind, "urls");
-        assert_eq!(entries[0].source.name(), "arxiv");
+        assert_eq!(entries[0].kind.label(), "urls");
+        assert_eq!(entries[0].as_source().name(), "arxiv");
     }
 
     #[test]
@@ -3010,6 +3164,76 @@ mod tests {
         let client = reqwest::Client::new();
         assert!(parse_sources(&["nodir".to_string()], &[], &client).is_err());
         assert!(parse_sources(&[], &["nourl".to_string()], &client).is_err());
+    }
+
+    // ── pick_web_route (dyn routing rules) ─────────────────────────────
+
+    fn dir_entry(name: &str) -> SourceEntry {
+        SourceEntry {
+            name: name.into(),
+            kind: SourceKind::Dir(FolderSource::named(name, "/tmp")),
+            active: true,
+        }
+    }
+
+    fn url_entry(name: &str) -> SourceEntry {
+        SourceEntry {
+            name: name.into(),
+            kind: SourceKind::Urls(UrlSource::new(name, reqwest::Client::new())),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn route_dyn_off_goes_to_folder() {
+        let sources = vec![dir_entry("papers"), url_entry("arxiv")];
+        assert!(matches!(
+            pick_web_route(false, &sources),
+            WebRoute::Folder
+        ));
+    }
+
+    #[test]
+    fn route_without_sources_goes_to_folder() {
+        assert!(matches!(pick_web_route(true, &[]), WebRoute::Folder));
+    }
+
+    #[test]
+    fn route_prefers_first_active_url_source() {
+        let sources = vec![dir_entry("papers"), url_entry("arxiv")];
+        match pick_web_route(true, &sources) {
+            WebRoute::Url { name } => assert_eq!(name, "arxiv"),
+            other => panic!("expected Url route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_falls_back_to_first_active_dir_source() {
+        let sources = vec![dir_entry("papers"), dir_entry("books")];
+        match pick_web_route(true, &sources) {
+            WebRoute::Dir { name } => assert_eq!(name, "papers"),
+            other => panic!("expected Dir route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_skips_inactive_sources() {
+        let mut url = url_entry("arxiv");
+        url.active = false;
+        let mut dir = dir_entry("papers");
+        dir.active = false;
+        // Inactive URL + active dir → dir wins.
+        let sources = vec![url.clone(), dir_entry("books")];
+        match pick_web_route(true, &sources) {
+            WebRoute::Dir { name } => assert_eq!(name, "books"),
+            other => panic!("expected Dir route, got {other:?}"),
+        }
+        // Everything inactive → folder.
+        let sources = vec![url, dir];
+        assert!(matches!(
+            pick_web_route(true, &sources),
+            WebRoute::Folder
+        ));
     }
 
     #[test]
