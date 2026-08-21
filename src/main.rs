@@ -9,12 +9,12 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 use ragrig::{
     AttachedDocument, ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser,
-    DocumentParsers, DocumentSource, EmbedderSpec, EpubParserBackend, FileIndexResult,
-    FolderSource, FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker,
+    DocumentParsers, Corpus, EmbedderSpec, EpubParserBackend, FileIndexResult,
+    FolderCorpus, FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker,
     LlmReranker, LogHistory, MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach,
     RagAgent, RagrigError, Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn,
-    TurnRole, UrlSource, WeightedFusionRanker, available_chunkers, ingest_source,
-    scan_document_files, search_by_document, sync_source,
+    TurnRole, UrlCorpus, WeightedFusionRanker, available_chunkers, ingest_corpus,
+    scan_document_files, search_by_document, sync_corpus,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::{parsers, store};
@@ -100,22 +100,22 @@ struct Cli {
     /// profiles.  Defaults to the current directory.
     #[arg(long = "workspace", value_name = "DIR")]
     pub workspace: Option<PathBuf>,
-    /// Shortcut for `--workspace <DIR> --source-dir folder=<DIR>`.
+    /// Shortcut for `--workspace <DIR> --corpus-dir folder=<DIR>`.
     #[arg(short, long, value_name = "DIR", conflicts_with = "workspace")]
     pub folder: Option<PathBuf>,
     /// Load a named profile (JSON) from `.ragrig/profiles/` before applying
     /// CLI overrides.  Use `/profile save <name>` in the REPL to create one.
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
-    /// Additional document sources: a named directory.  Repeatable; format
-    /// `NAME=DIR`, e.g. `--source-dir papers=/data/papers`.
-    #[arg(long = "source-dir", value_name = "NAME=DIR")]
-    pub source_dirs: Vec<String>,
-    /// Additional document sources: a named URL.  Repeatable; format
-    /// `NAME=URL`, e.g. `--source-urls arxiv=https://arxiv.org/pdf/2410.0.pdf`.
+    /// Additional document corpora: a named directory.  Repeatable; format
+    /// `NAME=DIR`, e.g. `--corpus-dir papers=/data/papers`.
+    #[arg(long = "corpus-dir", value_name = "NAME=DIR")]
+    pub corpus_dirs: Vec<String>,
+    /// Additional document corpora: a named URL.  Repeatable; format
+    /// `NAME=URL`, e.g. `--corpus-urls arxiv=https://arxiv.org/pdf/2410.0.pdf`.
     /// Repeating the same NAME accumulates URLs into one curated list.
-    #[arg(long = "source-urls", value_name = "NAME=URL")]
-    pub source_urls: Vec<String>,
+    #[arg(long = "corpus-urls", value_name = "NAME=URL")]
+    pub corpus_urls: Vec<String>,
     #[arg(long, env = "SEMANTIC_SCHOLAR_API_KEY")]
     pub semantic_scholar_api_key: Option<String>,
 
@@ -200,17 +200,17 @@ impl From<CliMemoryConfig> for MemoryConfig {
     }
 }
 
-/// Resolve the workspace and implicit-source handling from the CLI args:
+/// Resolve the workspace and implicit-corpus handling from the CLI args:
 ///
-/// - `--folder X`          → workspace X plus a `folder=X` dir source
-/// - `--workspace X`       → workspace X, no implicit source
-/// - neither, no sources   → workspace `.` plus a `folder=.` dir source
-/// - explicit sources      → workspace `.`, no implicit source
-fn resolve_workspace_and_sources(
+/// - `--folder X`          → workspace X plus a `folder=X` dir corpus
+/// - `--workspace X`       → workspace X, no implicit corpus
+/// - neither, no corpora   → workspace `.` plus a `folder=.` dir corpus
+/// - explicit corpora      → workspace `.`, no implicit corpus
+fn resolve_workspace_and_corpora(
     folder: Option<&PathBuf>,
     workspace: Option<&PathBuf>,
-    mut source_dirs: Vec<String>,
-    source_urls: &[String],
+    mut corpus_dirs: Vec<String>,
+    corpus_urls: &[String],
 ) -> (PathBuf, Vec<String>) {
     let explicit_workspace = workspace.is_some();
     let workspace = match (folder, workspace) {
@@ -219,22 +219,22 @@ fn resolve_workspace_and_sources(
         (None, None) => PathBuf::from("."),
     };
     if let Some(f) = folder {
-        // --folder is sugar for --workspace <dir> --source-dir folder=<dir>.
-        source_dirs.push(format!("folder={}", f.display()));
-    } else if !explicit_workspace && source_dirs.is_empty() && source_urls.is_empty() {
-        // Bare invocation: --workspace . --source-dir folder=.
-        source_dirs.push("folder=.".to_string());
+        // --folder is sugar for --workspace <dir> --corpus-dir folder=<dir>.
+        corpus_dirs.push(format!("folder={}", f.display()));
+    } else if !explicit_workspace && corpus_dirs.is_empty() && corpus_urls.is_empty() {
+        // Bare invocation: --workspace . --corpus-dir folder=.
+        corpus_dirs.push("folder=.".to_string());
     }
-    (workspace, source_dirs)
+    (workspace, corpus_dirs)
 }
 
 impl From<Cli> for RagrigConfig {
     fn from(c: Cli) -> Self {
-        let (workspace, source_dirs) = resolve_workspace_and_sources(
+        let (workspace, corpus_dirs) = resolve_workspace_and_corpora(
             c.folder.as_ref(),
             c.workspace.as_ref(),
-            c.source_dirs,
-            &c.source_urls,
+            c.corpus_dirs,
+            &c.corpus_urls,
         );
         RagrigConfig {
             workspace,
@@ -242,29 +242,29 @@ impl From<Cli> for RagrigConfig {
             embed: c.embed.into(),
             parse: c.parse.into(),
             memory: c.memory.into(),
-            source_dirs,
-            source_urls: c.source_urls,
+            corpus_dirs,
+            corpus_urls: c.corpus_urls,
             semantic_scholar_api_key: c.semantic_scholar_api_key,
         }
     }
 }
 
-/// Choose the web-download destination: `dyn` on → first active URL source,
-/// else first active directory source; `dyn` off or no active named sources
+/// Choose the web-download destination: `dyn` on → first active URL corpus,
+/// else first active directory corpus; `dyn` off or no active named corpora
 /// → the main folder (legacy behaviour).
-fn pick_web_route(dyn_sources: bool, sources: &[SourceEntry]) -> WebRoute {
-    if dyn_sources {
-        if let Some(e) = sources
+fn pick_web_route(dyn_corpora: bool, corpora: &[CorpusEntry]) -> WebRoute {
+    if dyn_corpora {
+        if let Some(e) = corpora
             .iter()
-            .find(|e| e.active && matches!(&e.kind, SourceKind::Urls(_)))
+            .find(|e| e.active && matches!(&e.kind, CorpusKind::Urls(_)))
         {
             return WebRoute::Url {
                 name: e.name.clone(),
             };
         }
-        if let Some(e) = sources
+        if let Some(e) = corpora
             .iter()
-            .find(|e| e.active && matches!(&e.kind, SourceKind::Dir(_)))
+            .find(|e| e.active && matches!(&e.kind, CorpusKind::Dir(_)))
         {
             return WebRoute::Dir {
                 name: e.name.clone(),
@@ -276,42 +276,42 @@ fn pick_web_route(dyn_sources: bool, sources: &[SourceEntry]) -> WebRoute {
 
 // ── Session: carries all context between REPL cycles ──────────────────────
 
-/// Concrete kind of a named document source.  Kept concrete (rather than
-/// `Box<dyn DocumentSource>` alone) so the REPL can call type-specific
-/// methods: `UrlSource::add_url` for dynamic routing and
-/// `FolderSource::folder` for saving downloads into a directory source.
+/// Concrete kind of a named document corpus.  Kept concrete (rather than
+/// `Box<dyn Corpus>` alone) so the REPL can call type-specific
+/// methods: `UrlCorpus::add_url` for dynamic routing and
+/// `FolderCorpus::folder` for saving downloads into a directory corpus.
 #[derive(Debug, Clone)]
-enum SourceKind {
-    Dir(FolderSource),
-    Urls(UrlSource),
+enum CorpusKind {
+    Dir(FolderCorpus),
+    Urls(UrlCorpus),
 }
 
-impl SourceKind {
+impl CorpusKind {
     /// `"dir"` or `"urls"` — for display.
     fn label(&self) -> &'static str {
         match self {
-            SourceKind::Dir(_) => "dir",
-            SourceKind::Urls(_) => "urls",
+            CorpusKind::Dir(_) => "dir",
+            CorpusKind::Urls(_) => "urls",
         }
     }
 }
 
-/// A named document source registered from the command line
-/// (`--source-dir` / `--source-urls`), plus its on/off state, toggled with
-/// `/source <name> on|off`.
+/// A named document corpus registered from the command line
+/// (`--corpus-dir` / `--corpus-urls`), plus its on/off state, toggled with
+/// `/corpus <name> on|off`.
 #[derive(Debug, Clone)]
-struct SourceEntry {
+struct CorpusEntry {
     name: String,
-    kind: SourceKind,
+    kind: CorpusKind,
     active: bool,
 }
 
-impl SourceEntry {
-    /// The source as a trait object, for ingestion.
-    fn as_source(&self) -> &dyn DocumentSource {
+impl CorpusEntry {
+    /// The corpus as a trait object, for ingestion.
+    fn as_corpus(&self) -> &dyn Corpus {
         match &self.kind {
-            SourceKind::Dir(folder) => folder,
-            SourceKind::Urls(urls) => urls,
+            CorpusKind::Dir(folder) => folder,
+            CorpusKind::Urls(urls) => urls,
         }
     }
 }
@@ -319,9 +319,9 @@ impl SourceEntry {
 /// Where a runtime web download is routed by the `dyn` rules.
 #[derive(Debug)]
 enum WebRoute {
-    /// First active URL source: the URL joins its curated list.
+    /// First active URL corpus: the URL joins its curated list.
     Url { name: String },
-    /// First active directory source: the file is saved into its directory.
+    /// First active directory corpus: the file is saved into its directory.
     Dir { name: String },
     /// Main folder (legacy behaviour; also when `dyn` is off).
     Folder,
@@ -375,14 +375,14 @@ struct Session {
     /// Externally attached documents — parsed text injected into the next
     /// RAG query.  Cleared after each query (one-shot by default).
     attached_docs: Vec<AttachedDocument>,
-    /// Named document sources (`--source-dir` / `--source-urls`), toggled
-    /// with `/source <name> on|off`.
-    sources: Vec<SourceEntry>,
-    /// Dynamic routing for web downloads (`/source dyn on|off`).  When on,
+    /// Named document corpora (`--corpus-dir` / `--corpus-urls`), toggled
+    /// with `/corpus <name> on|off`.
+    corpora: Vec<CorpusEntry>,
+    /// Dynamic routing for web downloads (`/corpus dyn on|off`).  When on,
     /// `/download` and `/get` route documents into the first active URL
-    /// source (else the first active directory source) instead of the main
+    /// corpus (else the first active directory corpus) instead of the main
     /// folder.
-    dyn_sources: bool,
+    dyn_corpora: bool,
     /// Whether in-session transcript memory is enabled.  `false` when the
     /// user runs `/memory off` — turns are not accumulated and the
     /// transcript passed to the agent is always empty.
@@ -417,7 +417,7 @@ enum Command {
     Parser(String),
     Profile(String),
     Prompt(String),
-    Source(String),
+    Corpus(String),
     Log(String),
     RagQuery(String),
     Unknown(String),
@@ -431,8 +431,8 @@ enum Command {
 /// 1. Builds the chat agent, embedding backend, and memory agent from
 ///    configuration via their `*Spec` factories.
 /// 2. Opens or creates the vector store in the workspace directory.
-/// 3. Parses the named document sources (`--source-dir` / `--source-urls`,
-///    plus the implicit `folder` source from `--folder` or the bare default)
+/// 3. Parses the named document corpora (`--corpus-dir` / `--corpus-urls`,
+///    plus the implicit `folder` corpus from `--folder` or the bare default)
 ///    and syncs each active one into the store.
 /// 4. Constructs a [`Session`] carrying all state needed by the REPL.
 ///
@@ -470,75 +470,75 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
     list
 }
 
-/// Parse the `name=value` command-line source specs into document sources.
+/// Parse the `name=value` command-line corpus specs into document corpora.
 ///
-/// - `--source-dir name=path`  → a [`FolderSource`] named `name`.
-/// - `--source-urls name=url`  → adds `url` to the [`UrlSource`] named `name`;
+/// - `--corpus-dir name=path`  → a [`FolderCorpus`] named `name`.
+/// - `--corpus-urls name=url`  → adds `url` to the [`UrlCorpus`] named `name`;
 ///   repeating a name builds one curated list.
 ///
-/// Duplicate names are rejected so every source keeps a unique provenance
-/// identity in the store.  Sources start **active** and are synced into the
+/// Duplicate names are rejected so every corpus keeps a unique provenance
+/// identity in the store.  Corpora start **active** and are synced into the
 /// store at startup.
-fn parse_sources(
-    source_dirs: &[String],
-    source_urls: &[String],
+fn parse_corpora(
+    corpus_dirs: &[String],
+    corpus_urls: &[String],
     http_client: &reqwest::Client,
-) -> Result<Vec<SourceEntry>> {
-    let mut dirs: Vec<(String, FolderSource)> = Vec::new();
-    let mut urls: Vec<(String, UrlSource)> = Vec::new();
+) -> Result<Vec<CorpusEntry>> {
+    let mut dirs: Vec<(String, FolderCorpus)> = Vec::new();
+    let mut urls: Vec<(String, UrlCorpus)> = Vec::new();
     let mut names: Vec<String> = Vec::new();
 
-    for spec in source_dirs {
+    for spec in corpus_dirs {
         let Some((name, dir)) = spec.split_once('=') else {
-            anyhow::bail!("Invalid --source-dir '{spec}': expected NAME=/path/to/dir");
+            anyhow::bail!("Invalid --corpus-dir '{spec}': expected NAME=/path/to/dir");
         };
         let (name, dir) = (name.trim(), dir.trim());
         if name.is_empty() || dir.is_empty() {
-            anyhow::bail!("Invalid --source-dir '{spec}': expected NAME=/path/to/dir");
+            anyhow::bail!("Invalid --corpus-dir '{spec}': expected NAME=/path/to/dir");
         }
         if names.iter().any(|n| n == name) {
-            anyhow::bail!("Duplicate source name '{name}'");
+            anyhow::bail!("Duplicate corpus name '{name}'");
         }
         names.push(name.to_string());
-        dirs.push((name.to_string(), FolderSource::named(name, dir)));
+        dirs.push((name.to_string(), FolderCorpus::named(name, dir)));
     }
 
-    for spec in source_urls {
+    for spec in corpus_urls {
         let Some((name, url)) = spec.split_once('=') else {
-            anyhow::bail!("Invalid --source-urls '{spec}': expected NAME=URL");
+            anyhow::bail!("Invalid --corpus-urls '{spec}': expected NAME=URL");
         };
         let (name, url) = (name.trim(), url.trim());
         if name.is_empty() || url.is_empty() {
-            anyhow::bail!("Invalid --source-urls '{spec}': expected NAME=URL");
+            anyhow::bail!("Invalid --corpus-urls '{spec}': expected NAME=URL");
         }
-        if let Some((_, source)) = urls.iter_mut().find(|(n, _)| n == name) {
+        if let Some((_, corpus)) = urls.iter_mut().find(|(n, _)| n == name) {
             // Repeating a name accumulates URLs into one curated list.
-            source.add_url(url);
+            corpus.add_url(url);
             continue;
         }
         if names.iter().any(|n| n == name) {
             anyhow::bail!(
-                "Duplicate source name '{name}' (already a --source-dir source)"
+                "Duplicate corpus name '{name}' (already a --corpus-dir corpus)"
             );
         }
         names.push(name.to_string());
-        let source = UrlSource::new(name, http_client.clone())
+        let corpus = UrlCorpus::new(name, http_client.clone())
             .with_max_download_bytes(Some(DEFAULT_MAX_DOWNLOAD_BYTES));
-        source.add_url(url);
-        urls.push((name.to_string(), source));
+        corpus.add_url(url);
+        urls.push((name.to_string(), corpus));
     }
 
-    let mut entries: Vec<SourceEntry> = dirs
+    let mut entries: Vec<CorpusEntry> = dirs
         .into_iter()
-        .map(|(name, source)| SourceEntry {
+        .map(|(name, corpus)| CorpusEntry {
             name,
-            kind: SourceKind::Dir(source),
+            kind: CorpusKind::Dir(corpus),
             active: true,
         })
         .collect();
-    entries.extend(urls.into_iter().map(|(name, source)| SourceEntry {
+    entries.extend(urls.into_iter().map(|(name, corpus)| CorpusEntry {
         name,
-        kind: SourceKind::Urls(source),
+        kind: CorpusKind::Urls(corpus),
         active: true,
     }));
     Ok(entries)
@@ -602,7 +602,7 @@ async fn bootstrap(
     );
 
     // Open or create the vector store in the workspace.  Documents come
-    // exclusively from the named sources; the workspace is state only.
+    // exclusively from the named corpora; the workspace is state only.
     info!("Workspace: {}", config.workspace.display());
     let store = store::open_store(&config.workspace).await?;
     let chunk_cfg = ChunkConfig::new(config.parse.chunk_size, config.parse.chunk_overlap)?;
@@ -639,16 +639,16 @@ async fn bootstrap(
 
     let agent = agent_builder.build()?;
 
-    // ── Named document sources (--source-dir / --source-urls) ─────────
+    // ── Named document corpora (--corpus-dir / --corpus-urls) ───────
     let http_client = reqwest::Client::new();
-    let sources = parse_sources(&config.source_dirs, &config.source_urls, &http_client)?;
-    for entry in &sources {
-        info!("Source '{}' ({}) registered.", entry.name, entry.kind.label());
+    let corpora = parse_corpora(&config.corpus_dirs, &config.corpus_urls, &http_client)?;
+    for entry in &corpora {
+        info!("Corpus '{}' ({}) registered.", entry.name, entry.kind.label());
     }
-    for entry in sources.iter().filter(|e| e.active) {
-        info!("Indexing source '{}' ({}).", entry.name, entry.kind.label());
-        sync_source(
-            entry.as_source(),
+    for entry in corpora.iter().filter(|e| e.active) {
+        info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
+        sync_corpus(
+            entry.as_corpus(),
             &doc_parsers,
             agent.chunker(),
             agent.embedder(),
@@ -703,8 +703,8 @@ async fn bootstrap(
         http_client,
         prompt_memory: Vec::new(),
         attached_docs: Vec::new(),
-        sources,
-        dyn_sources: true,
+        corpora,
+        dyn_corpora: true,
         session_store,
         session_id,
         history_strategy: None,
@@ -799,8 +799,8 @@ impl From<&str> for Command {
         if input.starts_with("/parser") {
             return Command::Parser(after("/parser").trim().to_string());
         }
-        if input.starts_with("/source") {
-            return Command::Source(after("/source").trim().to_string());
+        if input.starts_with("/corpus") {
+            return Command::Corpus(after("/corpus").trim().to_string());
         }
         if input.starts_with("/profile") {
             return Command::Profile(after("/profile").trim().to_string());
@@ -862,7 +862,7 @@ impl Session {
             Command::Log(args_str) => self.cmd_log(&args_str).await,
             Command::Parser(args_str) => self.cmd_parser(&args_str).await,
             Command::Profile(args_str) => self.cmd_profile(&args_str).await,
-            Command::Source(args_str) => self.cmd_source(&args_str).await,
+            Command::Corpus(args_str) => self.cmd_corpus(&args_str).await,
             Command::RagQuery(q) => self.cmd_rag_query(&q).await,
             Command::Unknown(cmd) => {
                 println!("Unknown command: '{}'", cmd);
@@ -942,10 +942,10 @@ impl Session {
     // ── /download <url> ───────────────────────────────────────────────
 
     /// Choose the destination for a runtime web download:
-    /// `dyn` on → first active URL source, else first active directory
-    /// source; `dyn` off or no active sources → main folder.
+    /// `dyn` on → first active URL corpus, else first active directory
+    /// corpus; `dyn` off or no active corpora → main folder.
     fn choose_web_route(&self) -> WebRoute {
-        pick_web_route(self.dyn_sources, &self.sources)
+        pick_web_route(self.dyn_corpora, &self.corpora)
     }
 
     /// Download and index one web document, routed by the `dyn` rules.
@@ -956,44 +956,44 @@ impl Session {
         match self.choose_web_route() {
             WebRoute::Url { name } => {
                 let idx = self
-                    .sources
+                    .corpora
                     .iter()
                     .position(|e| e.name == name)
-                    .expect("route chose an existing source");
-                match &self.sources[idx].kind {
-                    SourceKind::Urls(source) => source.add_url(url),
-                    SourceKind::Dir(_) => unreachable!("route chose a URL source"),
+                    .expect("route chose an existing corpus");
+                match &self.corpora[idx].kind {
+                    CorpusKind::Urls(corpus) => corpus.add_url(url),
+                    CorpusKind::Dir(_) => unreachable!("route chose a URL corpus"),
                 }
-                let indexed = self.sync_source_entry(idx).await?;
+                let indexed = self.sync_corpus_entry(idx).await?;
                 Ok(format!(
-                    "Added '{url}' to URL source '{name}' ({indexed} documents indexed)."
+                    "Added '{url}' to URL corpus '{name}' ({indexed} documents indexed)."
                 ))
             }
             WebRoute::Dir { name } => {
                 let idx = self
-                    .sources
+                    .corpora
                     .iter()
                     .position(|e| e.name == name)
-                    .expect("route chose an existing source");
-                let folder = match &self.sources[idx].kind {
-                    SourceKind::Dir(source) => source.folder().to_path_buf(),
-                    SourceKind::Urls(_) => unreachable!("route chose a directory source"),
+                    .expect("route chose an existing corpus");
+                let folder = match &self.corpora[idx].kind {
+                    CorpusKind::Dir(corpus) => corpus.folder().to_path_buf(),
+                    CorpusKind::Urls(_) => unreachable!("route chose a directory corpus"),
                 };
                 let (bytes, filename, _content_type) =
                     ragrig::fetch_url(&self.http_client, url, Some(DEFAULT_MAX_DOWNLOAD_BYTES))
                         .await?;
                 let dest = folder.join(&filename);
                 std::fs::write(&dest, &bytes).with_context(|| {
-                    format!("failed to save '{}' into dir source '{name}'", dest.display())
+                    format!("failed to save '{}' into dir corpus '{name}'", dest.display())
                 })?;
-                let indexed = self.sync_source_entry(idx).await?;
+                let indexed = self.sync_corpus_entry(idx).await?;
                 Ok(format!(
-                    "Saved '{filename}' into dir source '{name}' ({indexed} documents indexed)."
+                    "Saved '{filename}' into dir corpus '{name}' ({indexed} documents indexed)."
                 ))
             }
             WebRoute::Folder => {
-                if self.dyn_sources && !self.sources.is_empty() {
-                    println!("Note: no active named sources — adding to the main folder.");
+                if self.dyn_corpora && !self.corpora.is_empty() {
+                    println!("Note: no active named corpora — adding to the main folder.");
                 }
                 ragrig::download_and_ingest_url_with_chunker(
                     self.agent.embedder(),
@@ -1122,7 +1122,7 @@ impl Session {
         println!("/attach <file>  — attach a document for the next query (one-shot, not indexed)");
         println!("/attach         — show currently attached files");
         println!("/attach clear   — clear all attachments");
-        println!("/download <url>  — download and ingest a PDF (dyn routing: first active URL source, else first active dir source)");
+        println!("/download <url>  — download and ingest a PDF (dyn routing: first active URL corpus, else first active dir corpus)");
         println!("/scholar <q>   — search Semantic Scholar (free API key for higher limits)");
         println!("/arxiv <q>      — search arXiv (no API key needed, no rate limits)");
         println!("/search         — show / adjust search parameters (topk, threshold, rank, by)");
@@ -1141,7 +1141,7 @@ impl Session {
             "/parser pdf unpdf|sink|extract|internal | epub epub — hot-swap parser per format"
         );
         println!("/profile save|show|load|list [name] — manage configuration profiles");
-        println!("/source <name> on|off — toggle a named document source (--source-dir / --source-urls); /source dyn on|off — dynamic web-download routing");
+        println!("/corpus <name> on|off — toggle a named document corpus (--corpus-dir / --corpus-urls); /corpus dyn on|off — dynamic web-download routing");
         println!("exit / quit     — end the session");
     }
 
@@ -1488,7 +1488,7 @@ impl Session {
                             "  [{:2}] {:.4}  {} — {:.100}",
                             i + 1,
                             sc.score,
-                            sc.chunk.source_file,
+                            sc.chunk.document,
                             sc.chunk.text.trim()
                         );
                     }
@@ -1525,9 +1525,9 @@ impl Session {
         let mut context = String::new();
         for (i, sc) in self.last_results.iter().take(5).enumerate() {
             context.push_str(&format!(
-                "[Document {} | Source: {}]\n{}\n\n",
+                "[Document {} | Corpus: {}]\n{}\n\n",
                 i + 1,
-                sc.chunk.source_file,
+                sc.chunk.document,
                 sc.chunk.text
             ));
         }
@@ -1764,29 +1764,29 @@ impl Session {
         if backend.eq_ignore_ascii_case("purge") {
             let store = self.agent.store();
             let count = store.len();
-            let sources: Vec<_> = store.sources().into_iter().collect();
-            for source in &sources {
-                store.delete_by_source(&source.0).await?;
+            let docs: Vec<_> = store.document_ids().into_iter().collect();
+            for doc in &docs {
+                store.delete_by_document(&doc.0).await?;
             }
             info!(
-                "Vector store purged ({} chunks across {} source files).",
+                "Vector store purged ({} chunks across {} documents).",
                 count,
-                sources.len()
+                docs.len()
             );
             return Ok(());
         }
 
         if backend.eq_ignore_ascii_case("index") {
-            info!("Re-indexing all active document sources...");
+            info!("Re-indexing all active document corpora...");
             let chunk_cfg =
                 ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
 
-            // Full re-ingest of every active source, stats aggregated.
+            // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
-            for entry in self.sources.iter().filter(|e| e.active) {
-                info!("Re-indexing source '{}' ({}).", entry.name, entry.kind.label());
-                let stats = ingest_source(
-                    entry.as_source(),
+            for entry in self.corpora.iter().filter(|e| e.active) {
+                info!("Re-indexing corpus '{}' ({}).", entry.name, entry.kind.label());
+                let stats = ingest_corpus(
+                    entry.as_corpus(),
                     &self.doc_parsers,
                     self.agent.chunker(),
                     self.agent.embedder(),
@@ -1948,10 +1948,10 @@ impl Session {
     /// embeds) when some or all pipelines are missing.
     async fn pipeline_indexed(&self) -> bool {
         // Collect the distinct extensions present in the active directory
-        // sources' corpora.
+        // corpora.
         let mut formats: Vec<String> = Vec::new();
-        for entry in self.sources.iter().filter(|e| e.active) {
-            if let SourceKind::Dir(folder) = &entry.kind {
+        for entry in self.corpora.iter().filter(|e| e.active) {
+            if let CorpusKind::Dir(folder) = &entry.kind {
                 for (doc, _name) in scan_document_files(folder.folder()) {
                     if let Some(ext) = doc.path().extension().and_then(|e| e.to_str())
                         && !formats.iter().any(|f| f == ext)
@@ -1968,7 +1968,7 @@ impl Session {
         for ext in &formats {
             let parser = self.doc_parsers.primary_name_for(ext).unwrap_or_default();
             let filter = PipelineFilter {
-                source: None,
+                corpus: None,
                 parser: Some(parser.to_string()),
                 chunker: Some(chunker.to_string()),
                 embedder: Some(embedder_id.clone()),
@@ -2006,7 +2006,7 @@ impl Session {
         let embedder_id = self.agent.embedder().metadata().id();
         let chunker = self.agent.chunker().name();
         let filter = PipelineFilter {
-            source: None,
+            corpus: None,
             parser: Some(parser.to_string()),
             chunker: Some(chunker.to_string()),
             embedder: Some(embedder_id.clone()),
@@ -2359,78 +2359,78 @@ impl Session {
         Ok(())
     }
 
-    // ── /source [<name> [on|off]] ─────────────────────────────
+    // ── /corpus [<name> [on|off]] ─────────────────────────────
 
-    /// Toggle a named document source on or off, or control dynamic routing.
+    /// Toggle a named document corpus on or off, or control dynamic routing.
     ///
-    /// - `/source`                  — list all configured sources + the `dyn` route
-    /// - `/source <name>`           — show one source's state
-    /// - `/source <name> on`        — index the source into the store (sync)
-    /// - `/source <name> off`       — remove the source's chunks from the store
-    /// - `/source dyn on|off`       — toggle dynamic routing for web downloads
-    async fn cmd_source(&mut self, args_str: &str) -> Result<()> {
+    /// - `/corpus`                  — list all configured corpora + the `dyn` route
+    /// - `/corpus <name>`           — show one corpus's state
+    /// - `/corpus <name> on`        — index the corpus into the store (sync)
+    /// - `/corpus <name> off`       — remove the corpus's chunks from the store
+    /// - `/corpus dyn on|off`       — toggle dynamic routing for web downloads
+    async fn cmd_corpus(&mut self, args_str: &str) -> Result<()> {
         let mut parts = args_str.split_whitespace();
         let Some(name) = parts.next() else {
-            if self.sources.is_empty() {
+            if self.corpora.is_empty() {
                 println!(
-                    "No named sources configured. Use --source-dir NAME=DIR or \
-                     --source-urls NAME=URL."
+                    "No named corpora configured. Use --corpus-dir NAME=DIR or \
+                     --corpus-urls NAME=URL."
                 );
             } else {
-                println!("Document sources:");
-                for e in &self.sources {
+                println!("Document corpora:");
+                for e in &self.corpora {
                     let state = if e.active { "on" } else { "off" };
                     println!("  {:<16} ({:<4}) {}", e.name, e.kind.label(), state);
                 }
             }
-            let state = if self.dyn_sources { "on" } else { "off" };
+            let state = if self.dyn_corpora { "on" } else { "off" };
             println!("  {:<16} ({:<4}) {}", "dyn", "route", state);
-            println!("Usage: /source <name> on|off   (or /source to list)");
+            println!("Usage: /corpus <name> on|off   (or /corpus to list)");
             return Ok(());
         };
 
-        // `dyn` is the virtual dynamic-routing entry, not a real source.
+        // `dyn` is the virtual dynamic-routing entry, not a real corpus.
         if name == "dyn" {
             match parts.next() {
                 None => {
-                    let state = if self.dyn_sources { "on" } else { "off" };
-                    println!("Dynamic routing (dyn) is {state}: /download and /get route into the first active URL source, else the first active directory source.");
+                    let state = if self.dyn_corpora { "on" } else { "off" };
+                    println!("Dynamic routing (dyn) is {state}: /download and /get route into the first active URL corpus, else the first active directory corpus.");
                 }
                 Some("on") => {
-                    self.dyn_sources = true;
-                    println!("Dynamic routing is on — web downloads go to the first active URL source (else the first active directory source).");
+                    self.dyn_corpora = true;
+                    println!("Dynamic routing is on — web downloads go to the first active URL corpus (else the first active directory corpus).");
                 }
                 Some("off") => {
-                    self.dyn_sources = false;
+                    self.dyn_corpora = false;
                     println!("Dynamic routing is off — web downloads go to the main folder.");
                 }
-                Some(other) => println!("Usage: /source dyn on|off (got '{other}')"),
+                Some(other) => println!("Usage: /corpus dyn on|off (got '{other}')"),
             }
             return Ok(());
         }
 
         match parts.next() {
-            None => match self.sources.iter().find(|e| e.name == name) {
+            None => match self.corpora.iter().find(|e| e.name == name) {
                 Some(e) => {
                     let state = if e.active { "on" } else { "off" };
-                    println!("Source '{}' ({}) is {}", e.name, e.kind.label(), state);
+                    println!("Corpus '{}' ({}) is {}", e.name, e.kind.label(), state);
                 }
-                None => println!("Unknown source '{name}'. Run /source to list sources."),
+                None => println!("Unknown corpus '{name}'. Run /corpus to list corpora."),
             },
-            Some("on") => self.source_on(name).await?,
-            Some("off") => self.source_off(name).await?,
-            Some(other) => println!("Usage: /source <name> on|off (got '{other}')"),
+            Some("on") => self.corpus_on(name).await?,
+            Some("off") => self.corpus_off(name).await?,
+            Some(other) => println!("Usage: /corpus <name> on|off (got '{other}')"),
         }
         Ok(())
     }
 
-    /// Sync one named source into the store with the current pipeline.
+    /// Sync one named corpus into the store with the current pipeline.
     /// Returns the number of documents indexed.
-    async fn sync_source_entry(&mut self, idx: usize) -> Result<usize> {
+    async fn sync_corpus_entry(&mut self, idx: usize) -> Result<usize> {
         let chunk_cfg =
             ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
-        let stats = sync_source(
-            self.sources[idx].as_source(),
+        let stats = sync_corpus(
+            self.corpora[idx].as_corpus(),
             &self.doc_parsers,
             self.agent.chunker(),
             self.agent.embedder(),
@@ -2441,41 +2441,41 @@ impl Session {
         Ok(stats.len())
     }
 
-    /// Enable a source: sync its documents into the store.
+    /// Enable a corpus: sync its documents into the store.
     ///
-    /// Calling `on` for an already-active source re-syncs it, so documents
-    /// added to the source at runtime are picked up.
-    async fn source_on(&mut self, name: &str) -> Result<()> {
-        let Some(idx) = self.sources.iter().position(|e| e.name == name) else {
-            anyhow::bail!("Unknown source '{name}'. Run /source to list sources.");
+    /// Calling `on` for an already-active corpus re-syncs it, so documents
+    /// added to the corpus at runtime are picked up.
+    async fn corpus_on(&mut self, name: &str) -> Result<()> {
+        let Some(idx) = self.corpora.iter().position(|e| e.name == name) else {
+            anyhow::bail!("Unknown corpus '{name}'. Run /corpus to list corpora.");
         };
-        if self.sources[idx].active {
-            println!("Source '{name}' is already on — syncing for changes.");
+        if self.corpora[idx].active {
+            println!("Corpus '{name}' is already on — syncing for changes.");
         } else {
-            println!("Indexing source '{name}' ({})...", self.sources[idx].kind.label());
+            println!("Indexing corpus '{name}' ({})...", self.corpora[idx].kind.label());
         }
-        let indexed = self.sync_source_entry(idx).await?;
-        self.sources[idx].active = true;
+        let indexed = self.sync_corpus_entry(idx).await?;
+        self.corpora[idx].active = true;
         println!(
-            "Source '{name}' is on ({} documents indexed; store: {} chunks).",
+            "Corpus '{name}' is on ({} documents indexed; store: {} chunks).",
             indexed,
             self.agent.store().len()
         );
         Ok(())
     }
 
-    /// Disable a source: remove its chunks from the store.
-    async fn source_off(&mut self, name: &str) -> Result<()> {
-        let Some(idx) = self.sources.iter().position(|e| e.name == name) else {
-            anyhow::bail!("Unknown source '{name}'. Run /source to list sources.");
+    /// Disable a corpus: remove its chunks from the store.
+    async fn corpus_off(&mut self, name: &str) -> Result<()> {
+        let Some(idx) = self.corpora.iter().position(|e| e.name == name) else {
+            anyhow::bail!("Unknown corpus '{name}'. Run /corpus to list corpora.");
         };
-        if !self.sources[idx].active {
-            println!("Source '{name}' is already off.");
+        if !self.corpora[idx].active {
+            println!("Corpus '{name}' is already off.");
             return Ok(());
         }
-        self.sources[idx].active = false;
-        self.agent.store().delete_source(name).await?;
-        println!("Source '{name}' is off; its chunks were removed from the store.");
+        self.corpora[idx].active = false;
+        self.agent.store().delete_corpus(name).await?;
+        println!("Corpus '{name}' is off; its chunks were removed from the store.");
         Ok(())
     }
 
@@ -2721,9 +2721,9 @@ impl Session {
                     trace!("Rewritten query: {:?}", rw);
                 }
                 trace!(
-                    "Chunks retrieved: {:?}  |  Sources: {:?}",
+                    "Chunks retrieved: {:?}  |  Documents: {:?}",
                     resp.chunks_retrieved,
-                    resp.sources
+                    resp.documents
                 );
                 trace!(
                     "System prompt ({} chars): {:.300}...",
@@ -2741,8 +2741,8 @@ impl Session {
                 } else {
                     String::new()
                 };
-                if let Some(ref sources) = resp.sources {
-                    let names: Vec<&str> = sources.iter().map(|s| s.0.as_str()).collect();
+                if let Some(ref documents) = resp.documents {
+                    let names: Vec<&str> = documents.iter().map(|s| s.0.as_str()).collect();
                     println!(
                         "--- {} chunks from [{}]{} in {:.1}s ---",
                         chunks,
@@ -3021,26 +3021,26 @@ mod tests {
         assert!(matches!(cmd, Command::RagQuery(q) if q == "What is RAG?"));
     }
 
-    // ── /source command ───────────────────────────────────────────────
+    // ── /corpus command ───────────────────────────────────────────────
 
     #[test]
-    fn parse_source_no_args() {
-        let cmd = Command::from("/source");
-        assert!(matches!(cmd, Command::Source(s) if s.is_empty()));
+    fn parse_corpus_no_args() {
+        let cmd = Command::from("/corpus");
+        assert!(matches!(cmd, Command::Corpus(s) if s.is_empty()));
     }
 
     #[test]
-    fn parse_source_toggle() {
-        let cmd = Command::from("/source papers on");
-        assert!(matches!(cmd, Command::Source(s) if s == "papers on"));
+    fn parse_corpus_toggle() {
+        let cmd = Command::from("/corpus papers on");
+        assert!(matches!(cmd, Command::Corpus(s) if s == "papers on"));
     }
 
-    // ── parse_sources ─────────────────────────────────────────────────
+    // ── parse_corpora ─────────────────────────────────────────────────
 
     #[test]
-    fn parse_sources_dir_and_urls() {
+    fn parse_corpora_dir_and_urls() {
         let client = reqwest::Client::new();
-        let entries = parse_sources(
+        let entries = parse_corpora(
             &["papers=/data/papers".to_string()],
             &["arxiv=https://arxiv.org/pdf/a.pdf".to_string()],
             &client,
@@ -3050,17 +3050,17 @@ mod tests {
         assert_eq!(entries[0].name, "papers");
         assert_eq!(entries[0].kind.label(), "dir");
         assert!(entries[0].active);
-        assert_eq!(entries[0].as_source().name(), "papers");
+        assert_eq!(entries[0].as_corpus().name(), "papers");
         assert_eq!(entries[1].name, "arxiv");
         assert_eq!(entries[1].kind.label(), "urls");
         assert!(entries[1].active);
-        assert_eq!(entries[1].as_source().name(), "arxiv");
+        assert_eq!(entries[1].as_corpus().name(), "arxiv");
     }
 
     #[test]
-    fn parse_sources_repeated_url_name_merges() {
+    fn parse_corpora_repeated_url_name_merges() {
         let client = reqwest::Client::new();
-        let entries = parse_sources(
+        let entries = parse_corpora(
             &[],
             &[
                 "arxiv=https://arxiv.org/pdf/a.pdf".to_string(),
@@ -3069,17 +3069,17 @@ mod tests {
             &client,
         )
         .unwrap();
-        // Both URLs land in one curated source, not two clashing ones.
+        // Both URLs land in one curated corpus, not two clashing ones.
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "arxiv");
         assert_eq!(entries[0].kind.label(), "urls");
-        assert_eq!(entries[0].as_source().name(), "arxiv");
+        assert_eq!(entries[0].as_corpus().name(), "arxiv");
     }
 
     #[test]
-    fn parse_sources_duplicate_dir_name_errors() {
+    fn parse_corpora_duplicate_dir_name_errors() {
         let client = reqwest::Client::new();
-        let err = parse_sources(
+        let err = parse_corpora(
             &[
                 "docs=/a".to_string(),
                 "docs=/b".to_string(),
@@ -3088,33 +3088,33 @@ mod tests {
             &client,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Duplicate source name 'docs'"));
+        assert!(err.to_string().contains("Duplicate corpus name 'docs'"));
     }
 
     #[test]
-    fn parse_sources_name_clash_between_kinds_errors() {
+    fn parse_corpora_name_clash_between_kinds_errors() {
         let client = reqwest::Client::new();
-        let err = parse_sources(
+        let err = parse_corpora(
             &["docs=/a".to_string()],
             &["docs=https://example.com/x.pdf".to_string()],
             &client,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Duplicate source name 'docs'"));
+        assert!(err.to_string().contains("Duplicate corpus name 'docs'"));
     }
 
     #[test]
-    fn parse_sources_missing_equals_errors() {
+    fn parse_corpora_missing_equals_errors() {
         let client = reqwest::Client::new();
-        assert!(parse_sources(&["nodir".to_string()], &[], &client).is_err());
-        assert!(parse_sources(&[], &["nourl".to_string()], &client).is_err());
+        assert!(parse_corpora(&["nodir".to_string()], &[], &client).is_err());
+        assert!(parse_corpora(&[], &["nourl".to_string()], &client).is_err());
     }
 
-    // ── resolve_workspace_and_sources (--folder / --workspace) ──────
+    // ── resolve_workspace_and_corpora (--folder / --workspace) ──────
 
     #[test]
-    fn resolve_folder_is_workspace_plus_source() {
-        let (ws, dirs) = resolve_workspace_and_sources(
+    fn resolve_folder_is_workspace_plus_corpus() {
+        let (ws, dirs) = resolve_workspace_and_corpora(
             Some(&PathBuf::from("/data/docs")),
             None,
             vec![],
@@ -3125,8 +3125,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_workspace_alone_has_no_implicit_source() {
-        let (ws, dirs) = resolve_workspace_and_sources(
+    fn resolve_workspace_alone_has_no_implicit_corpus() {
+        let (ws, dirs) = resolve_workspace_and_corpora(
             None,
             Some(&PathBuf::from("/data/ws")),
             vec![],
@@ -3138,14 +3138,14 @@ mod tests {
 
     #[test]
     fn resolve_bare_invocation_defaults_to_cwd() {
-        let (ws, dirs) = resolve_workspace_and_sources(None, None, vec![], &[]);
+        let (ws, dirs) = resolve_workspace_and_corpora(None, None, vec![], &[]);
         assert_eq!(ws, PathBuf::from("."));
         assert_eq!(dirs, vec!["folder=.".to_string()]);
     }
 
     #[test]
-    fn resolve_explicit_sources_suppress_implicit_dir() {
-        let (ws, dirs) = resolve_workspace_and_sources(
+    fn resolve_explicit_corpora_suppress_implicit_dir() {
+        let (ws, dirs) = resolve_workspace_and_corpora(
             None,
             None,
             vec![],
@@ -3157,70 +3157,70 @@ mod tests {
 
     // ── pick_web_route (dyn routing rules) ─────────────────────────────
 
-    fn dir_entry(name: &str) -> SourceEntry {
-        SourceEntry {
+    fn dir_entry(name: &str) -> CorpusEntry {
+        CorpusEntry {
             name: name.into(),
-            kind: SourceKind::Dir(FolderSource::named(name, "/tmp")),
+            kind: CorpusKind::Dir(FolderCorpus::named(name, "/tmp")),
             active: true,
         }
     }
 
-    fn url_entry(name: &str) -> SourceEntry {
-        SourceEntry {
+    fn url_entry(name: &str) -> CorpusEntry {
+        CorpusEntry {
             name: name.into(),
-            kind: SourceKind::Urls(UrlSource::new(name, reqwest::Client::new())),
+            kind: CorpusKind::Urls(UrlCorpus::new(name, reqwest::Client::new())),
             active: true,
         }
     }
 
     #[test]
     fn route_dyn_off_goes_to_folder() {
-        let sources = vec![dir_entry("papers"), url_entry("arxiv")];
+        let corpora = vec![dir_entry("papers"), url_entry("arxiv")];
         assert!(matches!(
-            pick_web_route(false, &sources),
+            pick_web_route(false, &corpora),
             WebRoute::Folder
         ));
     }
 
     #[test]
-    fn route_without_sources_goes_to_folder() {
+    fn route_without_corpora_goes_to_folder() {
         assert!(matches!(pick_web_route(true, &[]), WebRoute::Folder));
     }
 
     #[test]
-    fn route_prefers_first_active_url_source() {
-        let sources = vec![dir_entry("papers"), url_entry("arxiv")];
-        match pick_web_route(true, &sources) {
+    fn route_prefers_first_active_url_corpus() {
+        let corpora = vec![dir_entry("papers"), url_entry("arxiv")];
+        match pick_web_route(true, &corpora) {
             WebRoute::Url { name } => assert_eq!(name, "arxiv"),
             other => panic!("expected Url route, got {other:?}"),
         }
     }
 
     #[test]
-    fn route_falls_back_to_first_active_dir_source() {
-        let sources = vec![dir_entry("papers"), dir_entry("books")];
-        match pick_web_route(true, &sources) {
+    fn route_falls_back_to_first_active_dir_corpus() {
+        let corpora = vec![dir_entry("papers"), dir_entry("books")];
+        match pick_web_route(true, &corpora) {
             WebRoute::Dir { name } => assert_eq!(name, "papers"),
             other => panic!("expected Dir route, got {other:?}"),
         }
     }
 
     #[test]
-    fn route_skips_inactive_sources() {
+    fn route_skips_inactive_corpora() {
         let mut url = url_entry("arxiv");
         url.active = false;
         let mut dir = dir_entry("papers");
         dir.active = false;
         // Inactive URL + active dir → dir wins.
-        let sources = vec![url.clone(), dir_entry("books")];
-        match pick_web_route(true, &sources) {
+        let corpora = vec![url.clone(), dir_entry("books")];
+        match pick_web_route(true, &corpora) {
             WebRoute::Dir { name } => assert_eq!(name, "books"),
             other => panic!("expected Dir route, got {other:?}"),
         }
         // Everything inactive → folder.
-        let sources = vec![url, dir];
+        let corpora = vec![url, dir];
         assert!(matches!(
-            pick_web_route(true, &sources),
+            pick_web_route(true, &corpora),
             WebRoute::Folder
         ));
     }
@@ -3288,8 +3288,8 @@ mod tests {
         let config = RagrigConfig {
             workspace: "tests/fixtures/formats/pdf".into(),
             // Equivalent to the old `--folder` shortcut: the workspace is
-            // state-only; documents come from named sources.
-            source_dirs: vec!["folder=tests/fixtures/formats/pdf".to_string()],
+            // state-only; documents come from named corpora.
+            corpus_dirs: vec!["folder=tests/fixtures/formats/pdf".to_string()],
             chat: ChatConfig {
                 model: "gemma4:e4b".into(),
                 ..Default::default()

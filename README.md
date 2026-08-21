@@ -251,6 +251,7 @@ under a pipeline that has not been indexed yet is an error.
 | `/parser pdf unpdf\|sink\|extract\|internal\|vision \| epub epub` | Hot-swap document parser per format |
 | `/log [off\|error\|warn\|info\|debug\|trace]` | Show or change log verbosity at runtime |
 | `/profile save\|show\|load\|list [name]` | Manage configuration profiles |
+| `/corpus <name> on\|off \| dyn on\|off` | Toggle a named corpus (index/remove its chunks) or dynamic web-download routing |
 | `/search topk <N> \| threshold <F> \| rank <name> \| by <file>` | Tune retrieval or search by document |
 | `/hist [list \| load <id> \| delete <id>]` | Manage saved sessions |
 | `/help` | Show available commands |
@@ -330,7 +331,7 @@ ragrig-cli --folder ~/papers --profile physics --model gemma4:e4b
 | `/profile load <name>`   | Load a profile into memory without restarting agents — use `/chat`, `/embed`, `/memory` afterwards to apply it. |
 | `/profile list`          | List all saved profile names. |
 
-Profiles are stored under `<folder>/.ragrig/profiles/`.  The JSON is
+Profiles are stored under `<workspace>/.ragrig/profiles/`.  The JSON is
 hand-editable if you prefer typing values over REPL commands.
 
 ---
@@ -338,11 +339,15 @@ hand-editable if you prefer typing values over REPL commands.
 ## CLI Flags
 
 ```
-Usage: ragrig-cli --folder <FOLDER>
+Usage: ragrig-cli [OPTIONS]
 
 Options:
-  -f, --folder <FOLDER>            Document directory (PDFs, EPUBs, DOCXs, HTMLs)
-  -p, --profile <NAME>             Load a saved profile from .ragrig/profiles/ (JSON)
+      --workspace <DIR>             State directory for store, history, sessions, profiles [default: .]
+  -f, --folder <DIR>                Shortcut for --workspace <DIR> --corpus-dir folder=<DIR>
+      --corpus-dir <NAME=DIR>       Named document corpus: a directory.  Repeatable.
+      --corpus-urls <NAME=URL>      Named document corpus: a URL.  Repeatable; same NAME
+                                    accumulates URLs into one curated list.
+  -p, --profile <NAME>              Load a saved profile from .ragrig/profiles/ (JSON)
       --provider <PROVIDER>        Chat backend: ollama (default) or deepseek
       --deepseek-api-key <KEY>     DeepSeek API key [env: DEEPSEEK_API_KEY]
       --deepseek-model <MODEL>     DeepSeek model [default: deepseek-v4-pro]
@@ -464,7 +469,7 @@ If ragrig-cli reports `OllamaUnreachable`, work through these in order:
    ```
    Alternatively, install Ollama directly inside WSL.
 
-### I adjusted the context size and now Ragrig produces empty answers, or answers that clearly come from general knowledge, not the sources.
+### I adjusted the context size and now Ragrig produces empty answers, or answers that clearly come from general knowledge, not the indexed corpora.
 
 This happens, when the context size of local Ollama models exceeds the hard VRAM limits. See below for closer explanations.
 

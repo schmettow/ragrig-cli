@@ -7520,7 +7520,7 @@ dependencies = [
 
 [[package]]
 name = "ragrig"
-version = "0.9.11"
+version = "0.9.12"
 dependencies = [
  "anyhow",
  "arrow-array 59.2.0",
@@ -7564,7 +7564,7 @@ dependencies = [
 
 [[package]]
 name = "ragrig-cli"
-version = "0.9.11"
+version = "0.9.12"
 dependencies = [
  "anyhow",
  "clap",
