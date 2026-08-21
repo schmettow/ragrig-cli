@@ -1137,6 +1137,11 @@ impl Session {
         println!("/hist [list | load <id> | delete <id>] — manage saved sessions");
         println!("/prompt chat|rewrite <file> | reset — load custom system prompts");
         println!("/log [off|error|warn|info|debug|trace] — show or change log verbosity");
+        #[cfg(feature = "kreuzberg")]
+        println!(
+            "/parser pdf unpdf|sink|extract|internal|kreuzberg | epub epub — hot-swap parser per format"
+        );
+        #[cfg(not(feature = "kreuzberg"))]
         println!(
             "/parser pdf unpdf|sink|extract|internal | epub epub — hot-swap parser per format"
         );
@@ -2301,6 +2306,9 @@ impl Session {
         if format.is_empty() {
             println!("PDF:  {:?}", self.pdf_parser);
             println!("EPUB: {:?}", self.epub_parser);
+            #[cfg(feature = "kreuzberg")]
+            println!("Usage: /parser pdf unpdf|sink|extract|internal|vision|kreuzberg");
+            #[cfg(not(feature = "kreuzberg"))]
             println!("Usage: /parser pdf unpdf|sink|extract|internal|vision");
             println!("       /parser epub epub");
             return Ok(());
@@ -2324,10 +2332,11 @@ impl Session {
                     "internal" => PdfParserBackend::Internal,
                     "vision" => PdfParserBackend::Vision,
                     other => {
-                        println!(
-                            "Unknown PDF parser: {}. Use unpdf, sink, extract, internal, or vision.",
-                            other
-                        );
+                        #[cfg(feature = "kreuzberg")]
+                        let hint = "unpdf, sink, extract, internal, vision, or kreuzberg";
+                        #[cfg(not(feature = "kreuzberg"))]
+                        let hint = "unpdf, sink, extract, internal, or vision";
+                        println!("Unknown PDF parser: {other}. Use {hint}.");
                         return Ok(());
                     }
                 };
@@ -3033,6 +3042,51 @@ mod tests {
     fn parse_corpus_toggle() {
         let cmd = Command::from("/corpus papers on");
         assert!(matches!(cmd, Command::Corpus(s) if s == "papers on"));
+    }
+
+    #[test]
+    fn corpus_command_parses_dyn_toggle() {
+        let on = Command::from("/corpus dyn on");
+        assert!(matches!(on, Command::Corpus(s) if s == "dyn on"));
+        let off = Command::from("/corpus dyn off");
+        assert!(matches!(off, Command::Corpus(s) if s == "dyn off"));
+    }
+
+    // ── CLI clap parsing (--corpus-dir / --corpus-urls) ───────────────
+
+    #[test]
+    fn cli_parses_corpus_flags() {
+        let cli = Cli::try_parse_from([
+            "ragrig",
+            "--corpus-dir",
+            "papers=/tmp/papers",
+            "--corpus-dir",
+            "books=/tmp/books",
+            "--corpus-urls",
+            "urls=https://example.com/a.pdf,https://example.com/b.pdf",
+        ])
+        .expect("CLI args should parse");
+
+        // The repeatable flags land in the Cli struct in order.
+        assert_eq!(
+            cli.corpus_dirs,
+            vec!["papers=/tmp/papers", "books=/tmp/books"]
+        );
+        assert_eq!(
+            cli.corpus_urls,
+            vec!["urls=https://example.com/a.pdf,https://example.com/b.pdf"]
+        );
+
+        // And they survive the conversion into the library config.
+        let config = RagrigConfig::from(cli);
+        assert_eq!(
+            config.corpus_dirs,
+            vec!["papers=/tmp/papers", "books=/tmp/books"]
+        );
+        assert_eq!(
+            config.corpus_urls,
+            vec!["urls=https://example.com/a.pdf,https://example.com/b.pdf"]
+        );
     }
 
     // ── parse_corpora ─────────────────────────────────────────────────

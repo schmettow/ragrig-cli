@@ -1,6 +1,6 @@
 [package]
 name = "ragrig-cli"
-version = "0.9.12"
+version = "1.0.0"
 edition = "2024"
 description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
@@ -25,7 +25,18 @@ offline-mkl = ["ragrig/offline-mkl"]
 lancedb = ["ragrig/lancedb"]
 test-fixtures = ["ragrig/test-fixtures"]
 kreuzberg = ["ragrig/kreuzberg"]
-all = ["ragrig/all"]
+chunker-textsplitter = ["ragrig/chunker-textsplitter"]
+chunker-cognigraph = ["ragrig/chunker-cognigraph"]
+# `all` must enable the CLI-local features too: `internal-embed` and
+# `kreuzberg` gate match arms in main.rs, and `ragrig/all` alone does not
+# set the CLI's own feature flags.
+all = [
+    "ragrig/all",
+    "internal-embed",
+    "kreuzberg",
+    "chunker-textsplitter",
+    "chunker-cognigraph",
+]
 
 [dependencies]
 ragrig = { path = "../ragrig" }

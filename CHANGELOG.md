@@ -5,6 +5,39 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0]
+
+### Added
+
+- **`/chunker [name]`** — show or hot-swap the chunking strategy.  Every
+  stored chunk records which (parser, chunker, embedder) pipeline built it;
+  swapping to a pipeline that has no chunks in the store prints a warning
+  and never re-embeds automatically (`/embed index` does).
+- **Named document corpora** — `--corpus-dir name=dir` (repeatable) and
+  `--corpus-urls name=url` (repeatable; same name accumulates one curated
+  URL list).  Several corpora share one vector store, each keeping its own
+  provenance identity.
+- **`/corpus <name> on|off`** — toggle a named corpus (syncs it in, or
+  removes its chunks) and **`/corpus dyn on|off`** — dynamic routing for
+  web downloads into the first active URL corpus, else the first active
+  directory corpus, else the main folder.
+- **`--workspace <DIR>`** — state directory for store, history, sessions,
+  and profiles.  `--folder <DIR>` remains as a shortcut for
+  `--workspace <DIR> --corpus-dir folder=<DIR>`.
+- **Chunker feature passthroughs** — `chunker-textsplitter` and
+  `chunker-cognigraph` make the feature-gated chunkers available to
+  `/chunker` (both are included in `all`).
+
+### Changed
+
+- **Aligned with ragrig 1.0.0** — the REPL builds against the current
+  library API: the `Corpus` trait (`source` terminology retired; legacy
+  profiles with `"source_dirs"`/`"source_urls"` still load), rig-core's
+  completion API, the vendored chunkedrs fork with its overlap fixes, and
+  the dimension-agnostic LanceDB store.
+- **Default chat model `qwen3.5:9b`** and **context budget 4096 tokens**
+  (previously `gemma2:latest` and 8192).
+
 ## [0.9.8] — 2026-07-11
 
 ### Added

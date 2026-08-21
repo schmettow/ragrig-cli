@@ -54,8 +54,14 @@ This downloads and compiles the latest release from
 
 ### Or build from source
 
+ragrig-cli builds against the `ragrig` library, which must sit next to it:
+
 ```bash
 git clone https://github.com/schmettow/ragrig
+cd ragrig
+cargo build --release           # optional — validates the library first
+cd ..
+git clone https://github.com/schmettow/ragrig-cli
 cd ragrig-cli
 cargo build --release
 ./target/release/ragrig-cli --folder ~/Documents/papers
@@ -249,6 +255,7 @@ under a pipeline that has not been indexed yet is an error.
 | `/memory <b> [model] [key] \| transcript \| log \| summary \| off \| purge` | Hot-swap memory, history diffusion, or clear |
 | `/prompt chat\|rewrite <file> \| reset` | Load custom system prompts |
 | `/parser pdf unpdf\|sink\|extract\|internal\|vision \| epub epub` | Hot-swap document parser per format |
+| `/chunker [name]` | Show or hot-swap the chunking strategy (warns when the pipeline is not indexed) |
 | `/log [off\|error\|warn\|info\|debug\|trace]` | Show or change log verbosity at runtime |
 | `/profile save\|show\|load\|list [name]` | Manage configuration profiles |
 | `/corpus <name> on\|off \| dyn on\|off` | Toggle a named corpus (index/remove its chunks) or dynamic web-download routing |
