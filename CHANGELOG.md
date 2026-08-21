@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles with `"source_dirs"`/`"source_urls"` still load), rig-core's
   completion API, the vendored chunkedrs fork with its overlap fixes, and
   the dimension-agnostic LanceDB store.
+- **Chat turns route through `AgentSession`** — the REPL no longer keeps
+  its own transcript/persistence bookkeeping (`prompt_memory`,
+  `session_store`, `memory_enabled` are gone).  Queries go through
+  `AgentSession::chat_detailed(_with_attachments)`, which accumulates
+  turns, diffuses history, and auto-saves; `/memory log|summary|transcript|off|purge`
+  map onto `set_history_strategy` / `set_use_transcript` / `clear_turns`,
+  `/hist` onto `load_session` / `list_sessions` / `delete_session`, and
+  session ids come from `SessionId::new()`.
 - **Ingestion routes through the agent** — bootstrap, `/embed index`, and
   `/corpus on` now call the agent's own `sync_corpus` / `reindex_corpus`
   (which carry the parser registry, chunk config, and chunker) instead of
