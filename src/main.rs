@@ -13,8 +13,8 @@ use ragrig::{
     FolderCorpus, FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker,
     LlmReranker, LogHistory, MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach,
     RagAgent, RagrigError, Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory, Turn,
-    TurnRole, UrlCorpus, WeightedFusionRanker, available_chunkers, ingest_corpus,
-    scan_document_files, search_by_document, sync_corpus,
+    TurnRole, UrlCorpus, WeightedFusionRanker, available_chunkers,
+    scan_document_files, search_by_document,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::{parsers, store};
@@ -621,6 +621,14 @@ async fn bootstrap(
         .chat(chat_agent)
         .embed(embedder)
         .store(store)
+        // The agent owns the parser registry and chunk config its ingestion
+        // methods use; the session keeps a matching registry for direct
+        // parse operations (search-by-document, attachments).
+        .parsers(DocumentParsers::new(filtered_parsers(
+            &config.parse.pdf_parser,
+            config.parse.sloppy_pdf,
+        )))
+        .chunk_config(chunk_cfg.clone())
         .rewriter(memory_agent)
         .attach_strategy(Box::new(PrependAttach))
         .context_tokens(config.chat.context_tokens)
@@ -647,15 +655,7 @@ async fn bootstrap(
     }
     for entry in corpora.iter().filter(|e| e.active) {
         info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
-        sync_corpus(
-            entry.as_corpus(),
-            &doc_parsers,
-            agent.chunker(),
-            agent.embedder(),
-            &chunk_cfg,
-            agent.store(),
-        )
-        .await?;
+        agent.sync_corpus(entry.as_corpus()).await?;
     }
 
     let row_count = agent.store().len();
@@ -951,8 +951,6 @@ impl Session {
     /// Download and index one web document, routed by the `dyn` rules.
     /// Returns a human-readable summary of where it went.
     async fn ingest_web_url(&mut self, url: &str) -> Result<String> {
-        let chunk_cfg =
-            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
         match self.choose_web_route() {
             WebRoute::Url { name } => {
                 let idx = self
@@ -995,9 +993,10 @@ impl Session {
                 if self.dyn_corpora && !self.corpora.is_empty() {
                     println!("Note: no active named corpora — adding to the main folder.");
                 }
+                let chunk_cfg = self.agent.chunk_config();
                 ragrig::download_and_ingest_url_with_chunker(
                     self.agent.embedder(),
-                    &self.doc_parsers,
+                    self.agent.parsers(),
                     &self.config.workspace,
                     &chunk_cfg,
                     &self.http_client,
@@ -1783,22 +1782,12 @@ impl Session {
 
         if backend.eq_ignore_ascii_case("index") {
             info!("Re-indexing all active document corpora...");
-            let chunk_cfg =
-                ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
 
             // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
             for entry in self.corpora.iter().filter(|e| e.active) {
                 info!("Re-indexing corpus '{}' ({}).", entry.name, entry.kind.label());
-                let stats = ingest_corpus(
-                    entry.as_corpus(),
-                    &self.doc_parsers,
-                    self.agent.chunker(),
-                    self.agent.embedder(),
-                    &chunk_cfg,
-                    self.agent.store(),
-                )
-                .await?;
+                let stats = self.agent.reindex_corpus(entry.as_corpus()).await?;
                 all_stats.extend(stats);
             }
             info!(
@@ -2342,9 +2331,15 @@ impl Session {
                 };
                 let old = std::mem::replace(&mut self.pdf_parser, new.clone());
                 info!("PDF parser: {:?} → {:?}", old, new);
-                // Rebuild the parser registry so the selected backend takes effect.
+                // Rebuild the parser registry so the selected backend takes
+                // effect — both for the session and for the agent's
+                // ingestion methods.
                 self.doc_parsers =
                     DocumentParsers::new(filtered_parsers(&new, self.config.parse.sloppy_pdf));
+                self.agent.set_parsers(DocumentParsers::new(filtered_parsers(
+                    &new,
+                    self.config.parse.sloppy_pdf,
+                )));
                 info!("Active parsers: {}", self.doc_parsers.names().join(", "));
                 // Provenance check: warn when the new parser has no chunks in
                 // the store yet — the user must run /embed index explicitly.
@@ -2436,17 +2431,7 @@ impl Session {
     /// Sync one named corpus into the store with the current pipeline.
     /// Returns the number of documents indexed.
     async fn sync_corpus_entry(&mut self, idx: usize) -> Result<usize> {
-        let chunk_cfg =
-            ChunkConfig::new(self.config.parse.chunk_size, self.config.parse.chunk_overlap)?;
-        let stats = sync_corpus(
-            self.corpora[idx].as_corpus(),
-            &self.doc_parsers,
-            self.agent.chunker(),
-            self.agent.embedder(),
-            &chunk_cfg,
-            self.agent.store(),
-        )
-        .await?;
+        let stats = self.agent.sync_corpus(self.corpora[idx].as_corpus()).await?;
         Ok(stats.len())
     }
 

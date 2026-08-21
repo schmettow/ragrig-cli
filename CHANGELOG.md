@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles with `"source_dirs"`/`"source_urls"` still load), rig-core's
   completion API, the vendored chunkedrs fork with its overlap fixes, and
   the dimension-agnostic LanceDB store.
+- **Ingestion routes through the agent** — bootstrap, `/embed index`, and
+  `/corpus on` now call the agent's own `sync_corpus` / `reindex_corpus`
+  (which carry the parser registry, chunk config, and chunker) instead of
+  bypassing `RagAgent` with `vector::ingest_corpus`/`sync_corpus`;
+  `/parser` swaps keep the agent's registry in sync.
 - **Default chat model `qwen3.5:9b`** and **context budget 4096 tokens**
   (previously `gemma2:latest` and 8192).
 
