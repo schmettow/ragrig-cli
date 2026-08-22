@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   map onto `set_history_strategy` / `set_use_transcript` / `clear_turns`,
   `/hist` onto `load_session` / `list_sessions` / `delete_session`, and
   session ids come from `SessionId::new()`.
+- **Streaming answers with a token counter and ESC-cancel** — queries now
+  stream token-by-token (`chat_streaming_detailed(_with_attachments)`);
+  the info header reports the received-token count, and pressing **ESC**
+  cancels the in-flight generation (a raw-mode stdin watcher flips a
+  `CancellationToken`; the terminal is restored on drop, and non-TTY
+  stdin degrades to a no-op).
+- **Embedding progress bar** — bootstrap indexing, `/embed index`, and
+  `/corpus on` render a live progress bar (files processed, chunks
+  embedded, failures) on stderr via the library's `Progress` events;
+  ESC cancels indexing between documents (`Cancelled` is handled
+  gracefully).
 - **Ingestion routes through the agent** — bootstrap, `/embed index`, and
   `/corpus on` now call the agent's own `sync_corpus` / `reindex_corpus`
   (which carry the parser registry, chunk config, and chunker) instead of

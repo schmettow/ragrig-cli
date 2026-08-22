@@ -41,9 +41,13 @@ all = [
 [dependencies]
 ragrig = { path = "../ragrig" }
 
-# ── CLI / REPL ──────────────────────────────────────────────────────────
+# ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
 rustyline = "18.0"
+# Raw-mode stdin watching for the ESC-cancels feature (termios) and
+# its non-blocking read loop (poll).  Already a transitive dependency
+# of rustyline; kept minimal with default-features off.
+nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
 
 # ── Async runtime ───────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }

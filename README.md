@@ -112,6 +112,16 @@ Query > /search topk 10              # fewer chunks, tighter context
 Query > /search threshold 0.08       # stricter semantic filter
 ```
 
+### Streaming, cancellation, and progress
+
+- Answers **stream token-by-token**; the info header reports the received
+  token count (`--- 5 chunks | 132 tokens from [a.pdf] in 2.1s ---`).
+- Press **ESC** while an answer is generating (or while documents are being
+  indexed) to cancel the operation; the terminal is restored afterwards.
+- Indexing (bootstrap, `/embed index`, `/corpus <name> on`) renders a live
+  progress bar with files processed, chunks embedded, and failures:
+  `[####----] 7/12 files | 341 chunks | papers/a.pdf (ESC: cancel)`.
+
 ### Hot-Swap Examples
 
 **Start with everything local, switch chat to cloud mid-session:**

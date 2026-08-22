@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::Level;
 use tracing_appender::rolling;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 use ragrig::{
-    AgentSession, AttachedDocument, ChatAgentSpec, ChunkConfig, DEFAULT_MAX_DOWNLOAD_BYTES,
-    DocumentParser, DocumentParsers, Corpus, EmbedderSpec, EpubParserBackend, FileIndexResult,
-    FolderCorpus, FsSessionStore, GenerationParams, HistoryStrategy, HybridRrfRanker,
-    LlmReranker, LogHistory, MmrDiversityRanker, PaperResult, PipelineFilter, PrependAttach,
-    RagAgent, RagrigError, Ranker, ScoredChunk, SessionId, SessionStore, SummaryHistory,
-    UrlCorpus, WeightedFusionRanker, available_chunkers, scan_document_files, search_by_document,
+    AgentSession, AttachedDocument, CancellationToken, ChatAgentSpec, ChunkConfig,
+    DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser, DocumentParsers, Corpus, EmbedderSpec,
+    EpubParserBackend, FileIndexResult, FolderCorpus, FsSessionStore, GenerationParams,
+    HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory, MmrDiversityRanker, PaperResult,
+    PipelineFilter, PrependAttach, ProgressEvent, RagAgent, RagrigError, Ranker, ScoredChunk,
+    SessionId, SessionStore, SummaryHistory, UrlCorpus, WeightedFusionRanker,
+    available_chunkers, scan_document_files, search_by_document,
 };
 use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
 use ragrig::{parsers, store};
@@ -22,7 +23,7 @@ use rustyline::error::ReadlineError;
 use std::fs;
 use std::io::{Write, stdout};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 mod search;
 use search::{search_arxiv, search_semantic_scholar};
@@ -643,7 +644,24 @@ async fn bootstrap(
     }
     for entry in corpora.iter().filter(|e| e.active) {
         info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
-        agent.sync_corpus(entry.as_corpus()).await?;
+        let token = CancellationToken::new();
+        let watcher = EscWatcher::spawn(token.clone());
+        let state = Arc::new(Mutex::new(EmbedProgress::default()));
+        let sink = embed_progress_sink(state);
+        match agent
+            .sync_corpus_with_progress(entry.as_corpus(), Some(&sink), Some(&token))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
+                eprint!("\r\x1b[2K");
+                eprintln!("Indexing cancelled — exiting.");
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
+        drop(watcher);
+        eprint!("\r\x1b[2K");
     }
 
     let row_count = agent.store().len();
@@ -1734,13 +1752,32 @@ impl Session {
         if backend.eq_ignore_ascii_case("index") {
             info!("Re-indexing all active document corpora...");
 
+            let token = CancellationToken::new();
+            let watcher = EscWatcher::spawn(token.clone());
+            let state = Arc::new(Mutex::new(EmbedProgress::default()));
+            let sink = embed_progress_sink(state);
+
             // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
             for entry in self.corpora.iter().filter(|e| e.active) {
                 info!("Re-indexing corpus '{}' ({}).", entry.name, entry.kind.label());
-                let stats = self.session.agent().reindex_corpus(entry.as_corpus()).await?;
-                all_stats.extend(stats);
+                match self
+                    .session
+                    .agent()
+                    .reindex_corpus_with_progress(entry.as_corpus(), Some(&sink), Some(&token))
+                    .await
+                {
+                    Ok(stats) => all_stats.extend(stats),
+                    Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
+                        eprint!("\r\x1b[2K");
+                        info!("Indexing cancelled.");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
+            drop(watcher);
+            eprint!("\r\x1b[2K");
             info!(
                 "Re-indexing complete. Store size: {} chunks.",
                 self.session.agent().store().len()
@@ -2383,8 +2420,18 @@ impl Session {
     /// Sync one named corpus into the store with the current pipeline.
     /// Returns the number of documents indexed.
     async fn sync_corpus_entry(&mut self, idx: usize) -> Result<usize> {
-        let stats = self.session.agent().sync_corpus(self.corpora[idx].as_corpus()).await?;
-        Ok(stats.len())
+        let token = CancellationToken::new();
+        let watcher = EscWatcher::spawn(token.clone());
+        let state = Arc::new(Mutex::new(EmbedProgress::default()));
+        let sink = embed_progress_sink(state);
+        let result = self
+            .session
+            .agent()
+            .sync_corpus_with_progress(self.corpora[idx].as_corpus(), Some(&sink), Some(&token))
+            .await;
+        drop(watcher);
+        eprint!("\r\x1b[2K");
+        Ok(result?.len())
     }
 
     /// Enable a corpus: sync its documents into the store.
@@ -2612,17 +2659,41 @@ impl Session {
         // Attachments are one-shot — take them out and let the session
         // consume them for this query only.
         let attached = std::mem::take(&mut self.attached_docs);
+
+        // ESC cancels: a raw-mode stdin watcher flips the token, the
+        // generator polls it between streamed tokens.
+        let token = CancellationToken::new();
+        let watcher = EscWatcher::spawn(token.clone());
+
+        let token_count = Arc::new(AtomicUsize::new(0));
+        let on_token = {
+            let token_count = token_count.clone();
+            move |t: String| {
+                token_count.fetch_add(1, Ordering::Relaxed);
+                print!("{}", t);
+                let _ = stdout().flush();
+            }
+        };
+
         let response = if has_attachments {
             self.session
-                .chat_detailed_with_attachments(query, &attached)
+                .chat_streaming_detailed_with_attachments(
+                    query,
+                    &attached,
+                    &on_token,
+                    Some(&token),
+                )
                 .await
         } else {
-            self.session.chat_detailed(query).await
+            self.session
+                .chat_streaming_detailed(query, &on_token, Some(&token))
+                .await
         };
+        drop(watcher);
 
         match response {
             Ok(resp) => {
-                println!("{}", resp.answer.trim());
+                println!(); // terminate the streamed answer line
 
                 // ── Trace: pipeline metadata ────────────────────
                 if let Some(ref rw) = resp.rewritten_query
@@ -2645,6 +2716,7 @@ impl Session {
 
                 // Info header.
                 let chunks = resp.chunks_retrieved.unwrap_or(0);
+                let tokens = token_count.load(Ordering::Relaxed);
                 let secs = start.elapsed().as_secs_f64();
                 let attach_hint = if has_attachments {
                     format!(" + {} attached doc(s)", attached.len())
@@ -2654,17 +2726,27 @@ impl Session {
                 if let Some(ref documents) = resp.documents {
                     let names: Vec<&str> = documents.iter().map(|s| s.0.as_str()).collect();
                     println!(
-                        "--- {} chunks from [{}]{} in {:.1}s ---",
+                        "--- {} chunks | {} tokens from [{}]{} in {:.1}s ---",
                         chunks,
+                        tokens,
                         names.join(", "),
                         attach_hint,
                         secs
                     );
                 } else {
-                    println!("--- {} chunks{} in {:.1}s ---", chunks, attach_hint, secs);
+                    println!(
+                        "--- {} chunks | {} tokens{} in {:.1}s ---",
+                        chunks, tokens, attach_hint, secs
+                    );
                 }
             }
+            Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
+                println!();
+                let tokens = token_count.load(Ordering::Relaxed);
+                println!("[cancelled after {} tokens]", tokens);
+            }
             Err(e) => {
+                println!();
                 if self.context_size_forced == ContextSizeMode::Auto
                     && self.session.agent_mut().try_recover_from_error(&e)
                 {
@@ -2829,6 +2911,165 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// ── ESC watcher + embedding progress bar ──────────────────────────────────
+
+/// Watches stdin for the ESC byte (0x1b) while an operation runs and flips
+/// the cancellation token when it arrives.  Puts the terminal into raw mode
+/// for its lifetime and restores it on drop.
+///
+/// rustyline owns the terminal while reading a line, so the watcher is only
+/// ever active between `readline` calls — the two never overlap.  When stdin
+/// is not a TTY (piped input), the watcher degrades to an inactive no-op.
+struct EscWatcher {
+    handle: Option<std::thread::JoinHandle<()>>,
+    original: Option<nix::sys::termios::Termios>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl EscWatcher {
+    /// Spawn the watcher.  Never fails: without a TTY it just stays inactive.
+    fn spawn(token: CancellationToken) -> Self {
+        use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+        use std::os::fd::{AsRawFd, BorrowedFd};
+
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Switch to raw mode (no canonical line buffering, no echo) so ESC
+        // arrives immediately instead of waiting for a newline.
+        let original = match tcgetattr(stdin)
+            .and_then(|orig| {
+                let mut raw = orig.clone();
+                raw.local_flags.remove(LocalFlags::ICANON | LocalFlags::ECHO);
+                tcsetattr(stdin, SetArg::TCSANOW, &raw).map(|_| orig)
+            }) {
+            Ok(orig) => Some(orig),
+            Err(_) => None,
+        };
+
+        let handle = original.as_ref().map(|_| {
+            let shutdown = shutdown.clone();
+            std::thread::spawn(move || {
+                use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+                let mut fds = [PollFd::new(stdin, PollFlags::POLLIN)];
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match poll(&mut fds, PollTimeout::from(100u16)) {
+                        Ok(0) => continue, // timeout — re-check shutdown
+                        Ok(_) => {
+                            let mut buf = [0u8; 16];
+                            match nix::unistd::read(stdin, &mut buf) {
+                                Ok(0) => return, // EOF — nothing to watch
+                                Ok(n) => {
+                                    if buf[..n].contains(&0x1b) {
+                                        token.cancel();
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        });
+
+        Self {
+            handle,
+            original,
+            shutdown,
+        }
+    }
+}
+
+impl Drop for EscWatcher {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            // The watcher thread cannot panic by construction; ignore.
+        }
+        if let Some(original) = &self.original {
+            use std::os::fd::{AsRawFd, BorrowedFd};
+            let stdin = unsafe { BorrowedFd::borrow_raw(std::io::stdin().as_raw_fd()) };
+            let _ = nix::sys::termios::tcsetattr(
+                stdin,
+                nix::sys::termios::SetArg::TCSANOW,
+                original,
+            );
+        }
+    }
+}
+
+/// Aggregate state for the embedding progress bar.
+#[derive(Default)]
+struct EmbedProgress {
+    total: usize,
+    started: usize,
+    done: usize,
+    chunks: usize,
+    failed: usize,
+    current: String,
+}
+
+/// Draw the one-line embedding progress bar to stderr (overwritten with
+/// `\r` on the next event; cleared by printing `\r\x1b[2K`).
+fn render_embed_progress(state: &EmbedProgress) {
+    const WIDTH: usize = 30;
+    let frac = if state.total > 0 {
+        (state.started as f64 / state.total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = (frac * WIDTH as f64) as usize;
+    let bar = format!(
+        "[{}{}]",
+        "#".repeat(filled),
+        "-".repeat(WIDTH.saturating_sub(filled))
+    );
+    let failed = if state.failed > 0 {
+        format!(" | {} failed", state.failed)
+    } else {
+        String::new()
+    };
+    eprint!(
+        "\r\x1b[2K{bar} {}/{} files | {} chunks{failed} | {} (ESC: cancel)",
+        state.started, state.total, state.chunks, state.current
+    );
+}
+
+/// Build the closure-based [`ragrig::Progress`] reporter for one indexing
+/// run, sharing `state` between events.
+fn embed_progress_sink(
+    state: Arc<Mutex<EmbedProgress>>,
+) -> impl Fn(&ProgressEvent) + Send + Sync {
+    move |event: &ProgressEvent| {
+        let mut st = state.lock().unwrap();
+        match event {
+            ProgressEvent::FileStarted {
+                index,
+                total,
+                corpus,
+                document,
+            } => {
+                st.total = *total;
+                st.started = *index + 1;
+                st.current = format!("{corpus}/{document}");
+            }
+            ProgressEvent::FileChunked { .. } | ProgressEvent::FileEmbedded { .. } => {}
+            ProgressEvent::ChunksEmbedded { done, .. } => st.chunks = *done,
+            ProgressEvent::FileStored => st.done += 1,
+            ProgressEvent::FileFailed { .. } => st.failed += 1,
+        }
+        render_embed_progress(&st);
+    }
+}
+
 // ── Utility functions ─────────────────────────────────────────────────────
 
 /// Strip ANSI escape sequences (bracketed paste, colors, etc.) from a string.
@@ -2894,7 +3135,7 @@ fn parse_number_range(input: &str) -> Result<Vec<usize>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ragrig::TurnRole;
+    use ragrig::{Cancel, TurnRole};
 
     // ── Command::from ─────────────────────────────────────────────────
 
@@ -3214,6 +3455,17 @@ mod tests {
     #[test]
     fn parse_slash_bye() {
         assert!(matches!(Command::from("/bye"), Command::Exit));
+    }
+
+    /// The ESC watcher degrades to an inert no-op without a TTY (piped
+    /// stdin, e.g. CI) — spawn and drop must both be safe.
+    #[test]
+    fn esc_watcher_without_tty_is_inert() {
+        let token = CancellationToken::new();
+        let watcher = EscWatcher::spawn(token.clone());
+        assert!(!token.is_cancelled());
+        drop(watcher);
+        assert!(!token.is_cancelled());
     }
 
     // ── Integration test ─────────────────────────────────────────────
