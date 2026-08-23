@@ -3065,6 +3065,8 @@ fn embed_progress_sink(
             ProgressEvent::ChunksEmbedded { done, .. } => st.chunks = *done,
             ProgressEvent::FileStored => st.done += 1,
             ProgressEvent::FileFailed { .. } => st.failed += 1,
+            // `ProgressEvent` is #[non_exhaustive] — future variants are ignored.
+            _ => {}
         }
         render_embed_progress(&st);
     }
