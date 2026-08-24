@@ -940,10 +940,16 @@ impl Session {
                     .corpora
                     .iter()
                     .position(|e| e.name == name)
-                    .expect("route chose an existing corpus");
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("internal: web route target '{name}' missing")
+                    })?;
                 match &self.corpora[idx].kind {
                     CorpusKind::Urls(corpus) => corpus.add_url(url),
-                    CorpusKind::Dir(_) => unreachable!("route chose a URL corpus"),
+                    CorpusKind::Dir(_) => {
+                        anyhow::bail!(
+                            "internal: web route chose a URL corpus, got directory '{name}'"
+                        )
+                    }
                 }
                 let indexed = self.sync_corpus_entry(idx).await?;
                 Ok(format!(
@@ -955,10 +961,16 @@ impl Session {
                     .corpora
                     .iter()
                     .position(|e| e.name == name)
-                    .expect("route chose an existing corpus");
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("internal: web route target '{name}' missing")
+                    })?;
                 let folder = match &self.corpora[idx].kind {
                     CorpusKind::Dir(corpus) => corpus.folder().to_path_buf(),
-                    CorpusKind::Urls(_) => unreachable!("route chose a directory corpus"),
+                    CorpusKind::Urls(_) => {
+                        anyhow::bail!(
+                            "internal: web route chose a directory corpus, got URLs '{name}'"
+                        )
+                    }
                 };
                 let (bytes, filename, _content_type) =
                     ragrig::fetch_url(&self.http_client, url, Some(DEFAULT_MAX_DOWNLOAD_BYTES))
@@ -2670,7 +2682,7 @@ impl Session {
         if level.is_empty() {
             println!(
                 "Interactive log level: {} — change with /log <off|error|warn|info|debug|trace>",
-                self.log_level.read().unwrap()
+                self.log_level.read().unwrap_or_else(|e| e.into_inner())
             );
             return Ok(());
         }
@@ -2696,7 +2708,7 @@ impl Session {
             }
         };
 
-        *self.log_level.write().unwrap() = filter_str.to_string();
+        *self.log_level.write().unwrap_or_else(|e| e.into_inner()) = filter_str.to_string();
         info!("Interactive log level set to {}.", level);
         Ok(())
     }
@@ -2903,7 +2915,7 @@ async fn main() -> Result<()> {
     let stderr_filter = {
         let lvl = stderr_level.clone();
         filter_fn(move |meta| {
-            let filter_str = lvl.read().unwrap();
+            let filter_str = lvl.read().unwrap_or_else(|e| e.into_inner());
             match filter_str.as_str() {
                 "off" => false,
                 "error" => *meta.level() <= Level::ERROR,
@@ -3129,7 +3141,7 @@ fn render_embed_progress(state: &EmbedProgress) {
 /// run, sharing `state` between events.
 fn embed_progress_sink(state: Arc<Mutex<EmbedProgress>>) -> impl Fn(&ProgressEvent) + Send + Sync {
     move |event: &ProgressEvent| {
-        let mut st = state.lock().unwrap();
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         match event {
             ProgressEvent::FileStarted {
                 index,
