@@ -445,6 +445,8 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
         PdfParserBackend::Extract => "pdf-extract",
         PdfParserBackend::Internal => "sloppy-pdf",
         PdfParserBackend::Vision => "vision-pdf",
+        // New backends added upstream: fall back to the legacy default.
+        _ => "pdf-extract",
     };
     let fallback = {
         #[cfg(feature = "kreuzberg")]
@@ -559,6 +561,8 @@ async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Resu
             chat_params.clone(),
             None,
         ),
+        // New providers added upstream: fall back to Ollama.
+        _ => ChatAgentSpec::ollama(config.chat.model.clone(), chat_params.clone(), None),
     };
     let chat_agent = initial_spec.build()?;
     info!(
@@ -577,6 +581,11 @@ async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Resu
         },
         #[cfg(feature = "internal-embed")]
         EmbeddingProvider::Fastembed => EmbedderSpec::Fastembed,
+        // New embedding backends added upstream: fall back to Ollama.
+        _ => EmbedderSpec::Ollama {
+            model: config.embed.model.clone(),
+            request_timeout_secs: None,
+        },
     };
     let embedder = embedder_spec.build()?;
     info!(
