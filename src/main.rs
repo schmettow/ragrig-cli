@@ -1,22 +1,19 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
-use std::sync::{Arc, Mutex, RwLock};
-use tracing::Level;
-use tracing_appender::rolling;
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{self, EnvFilter, fmt};
-use ragrig::{
-    AgentSession, AttachedDocument, CancellationToken, ChatAgentSpec, ChunkConfig,
-    DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser, DocumentParsers, Corpus, EmbedderSpec,
-    EpubParserBackend, FileIndexResult, FolderCorpus, FsSessionStore, GenerationParams,
-    HistoryStrategy, HybridRrfRanker, LlmReranker, LogHistory, MmrDiversityRanker, PaperResult,
-    PipelineFilter, PrependAttach, ProgressEvent, RagAgent, RagrigError, Ranker, ScoredChunk,
-    SessionId, SessionStore, SummaryHistory, UrlCorpus, WeightedFusionRanker,
-    available_chunkers, scan_document_files, search_by_document,
+use ragrig::types::{
+    ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig,
+    PdfParserBackend, Provider, RagrigConfig,
 };
-use ragrig::types::{ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig, PdfParserBackend, Provider, RagrigConfig};
+use ragrig::{
+    AgentSession, AttachedDocument, CancellationToken, ChatAgentSpec, ChunkConfig, Corpus,
+    DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser, DocumentParsers, EmbedderSpec, EpubParserBackend,
+    FileIndexResult, FolderCorpus, FsSessionStore, GenerationParams, HistoryStrategy,
+    HybridRrfRanker, LlmReranker, LogHistory, MmrDiversityRanker, PaperResult, PipelineFilter,
+    PrependAttach, ProgressEvent, RagAgent, RagrigError, Ranker, ScoredChunk, SessionId,
+    SessionStore, SummaryHistory, UrlCorpus, WeightedFusionRanker, available_chunkers,
+    scan_document_files, search_by_document,
+};
 use ragrig::{parsers, store};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -24,6 +21,12 @@ use std::fs;
 use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use tracing::Level;
+use tracing_appender::rolling;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{self, EnvFilter, fmt};
 
 mod search;
 use search::{search_arxiv, search_semantic_scholar};
@@ -62,7 +65,11 @@ struct CliChatConfig {
 struct CliEmbedConfig {
     #[arg(long = "embedding-provider", default_value = "ollama")]
     pub embedding_provider: String,
-    #[arg(short = 'e', long = "embedding-model", default_value = "nomic-embed-text:latest")]
+    #[arg(
+        short = 'e',
+        long = "embedding-model",
+        default_value = "nomic-embed-text:latest"
+    )]
     pub embedding_model: String,
     #[arg(long, default_value = "50")]
     pub top_k: usize,
@@ -389,7 +396,6 @@ struct Session {
 /// treated as a RAG query (`RagQuery`).
 enum Command {
     #[allow(dead_code)]
-
     Attach(String),
     Download(String),
     GetPapers(String),
@@ -431,7 +437,6 @@ enum Command {
 /// Filter the parser list to include the selected PDF backend as primary,
 /// plus a panic-fallback (kreuzberg when available, otherwise sloppy-pdf).
 fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn DocumentParser>> {
-    #[allow(deprecated)]
     let selected_pdf = match pdf {
         #[cfg(feature = "kreuzberg")]
         PdfParserBackend::Kreuzberg => "kreuzberg",
@@ -443,9 +448,13 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
     };
     let fallback = {
         #[cfg(feature = "kreuzberg")]
-        { "kreuzberg" }
+        {
+            "kreuzberg"
+        }
         #[cfg(not(feature = "kreuzberg"))]
-        { "sloppy-pdf" }
+        {
+            "sloppy-pdf"
+        }
     };
     let mut list = parsers::build_parsers();
     list.retain(|p| {
@@ -506,9 +515,7 @@ fn parse_corpora(
             continue;
         }
         if names.iter().any(|n| n == name) {
-            anyhow::bail!(
-                "Duplicate corpus name '{name}' (already a --corpus-dir corpus)"
-            );
+            anyhow::bail!("Duplicate corpus name '{name}' (already a --corpus-dir corpus)");
         }
         names.push(name.to_string());
         let corpus = UrlCorpus::new(name, http_client.clone())
@@ -533,23 +540,19 @@ fn parse_corpora(
     Ok(entries)
 }
 
-async fn bootstrap(
-    config: RagrigConfig,
-    log_level: Arc<RwLock<String>>,
-) -> Result<Session> {
+async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Result<Session> {
     // Build generation params from config.
     let chat_params = config.chat.params.clone();
     debug!(
         "Generation params: temperature={:?} top_p={:?} max_tokens={:?} seed={:?}",
-        chat_params.temperature,
-        chat_params.top_p,
-        chat_params.max_tokens,
-        chat_params.seed,
+        chat_params.temperature, chat_params.top_p, chat_params.max_tokens, chat_params.seed,
     );
 
     // Build the initial chat agent from config.
     let initial_spec = match config.chat.provider {
-        Provider::Ollama => ChatAgentSpec::ollama(config.chat.model.clone(), chat_params.clone(), None),
+        Provider::Ollama => {
+            ChatAgentSpec::ollama(config.chat.model.clone(), chat_params.clone(), None)
+        }
         Provider::Deepseek => ChatAgentSpec::deepseek(
             config.chat.deepseek_model.clone(),
             config.chat.deepseek_api_key.clone(),
@@ -583,7 +586,10 @@ async fn bootstrap(
     );
 
     // Build the document parser registry (needed before store setup).
-    let doc_parsers = DocumentParsers::new(filtered_parsers(&config.parse.pdf_parser, config.parse.sloppy_pdf));
+    let doc_parsers = DocumentParsers::new(filtered_parsers(
+        &config.parse.pdf_parser,
+        config.parse.sloppy_pdf,
+    ));
     info!(
         "Parsers: {}  |  Active PDF: {:?}  |  Chunker: markdown (default; /chunker to swap)",
         doc_parsers.names().join(", "),
@@ -640,7 +646,11 @@ async fn bootstrap(
     let http_client = reqwest::Client::new();
     let corpora = parse_corpora(&config.corpus_dirs, &config.corpus_urls, &http_client)?;
     for entry in &corpora {
-        info!("Corpus '{}' ({}) registered.", entry.name, entry.kind.label());
+        info!(
+            "Corpus '{}' ({}) registered.",
+            entry.name,
+            entry.kind.label()
+        );
     }
     for entry in corpora.iter().filter(|e| e.active) {
         info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
@@ -678,19 +688,17 @@ async fn bootstrap(
     let mut rl = DefaultEditor::new()?;
     let history_path = config.workspace.join(".ragrig_history");
     if history_path.exists()
-        && let Err(e) = rl.load_history(&history_path) {
-            warn!("Could not load history: {}", e);
-        }
+        && let Err(e) = rl.load_history(&history_path)
+    {
+        warn!("Could not load history: {}", e);
+    }
 
     info!("RAG System Online. Commands: /download <url> | /get <nums> | /help | exit");
-    info!(
-        "Ask questions based on your loaded documents (Arrow-Up for history, Ctrl+C to exit):"
-    );
+    info!("Ask questions based on your loaded documents (Arrow-Up for history, Ctrl+C to exit):");
 
     // ── Stateful chat session (filesystem‑backed store, fresh id) ──
     let sessions_dir = config.workspace.join(".ragrig").join("sessions");
-    let session_store: Box<dyn SessionStore> =
-        Box::new(FsSessionStore::new(sessions_dir)?);
+    let session_store: Box<dyn SessionStore> = Box::new(FsSessionStore::new(sessions_dir)?);
     let session = AgentSession::new(agent, session_store);
     info!("Session: {}", session.session_id().0);
 
@@ -724,9 +732,7 @@ impl From<&str> for Command {
             return Command::RagQuery(input.to_string());
         }
 
-        if input == "exit" || input == "quit"
-            || input == "/exit" || input == "/bye"
-        {
+        if input == "exit" || input == "quit" || input == "/exit" || input == "/bye" {
             return Command::Exit;
         }
         if input == "/help" {
@@ -950,7 +956,10 @@ impl Session {
                         .await?;
                 let dest = folder.join(&filename);
                 std::fs::write(&dest, &bytes).with_context(|| {
-                    format!("failed to save '{}' into dir corpus '{name}'", dest.display())
+                    format!(
+                        "failed to save '{}' into dir corpus '{name}'",
+                        dest.display()
+                    )
                 })?;
                 let indexed = self.sync_corpus_entry(idx).await?;
                 Ok(format!(
@@ -1089,7 +1098,9 @@ impl Session {
         println!("/attach <file>  — attach a document for the next query (one-shot, not indexed)");
         println!("/attach         — show currently attached files");
         println!("/attach clear   — clear all attachments");
-        println!("/download <url>  — download and ingest a PDF (dyn routing: first active URL corpus, else first active dir corpus)");
+        println!(
+            "/download <url>  — download and ingest a PDF (dyn routing: first active URL corpus, else first active dir corpus)"
+        );
         println!("/scholar <q>   — search Semantic Scholar (free API key for higher limits)");
         println!("/arxiv <q>      — search arXiv (no API key needed, no rate limits)");
         println!("/search         — show / adjust search parameters (topk, threshold, rank, by)");
@@ -1097,10 +1108,18 @@ impl Session {
         println!(
             "/refs [topic]   — extract references from last query results (optionally filtered by topic)"
         );
-        println!("/chat <backend> [model] [api_key] | context <N> — hot-swap chat engine or adjust context window");
-        println!("/embed <backend> [model] | purge | index — hot-swap embedding backend; index (re)builds the current pipeline");
-        println!("/chunker [name] — show or hot-swap the chunking strategy (warns when the pipeline is not indexed)");
-        println!("/memory <backend> [model] [key] | transcript | log | summary | off | purge — hot-swap memory + history diffusion");
+        println!(
+            "/chat <backend> [model] [api_key] | context <N> — hot-swap chat engine or adjust context window"
+        );
+        println!(
+            "/embed <backend> [model] | purge | index — hot-swap embedding backend; index (re)builds the current pipeline"
+        );
+        println!(
+            "/chunker [name] — show or hot-swap the chunking strategy (warns when the pipeline is not indexed)"
+        );
+        println!(
+            "/memory <backend> [model] [key] | transcript | log | summary | off | purge — hot-swap memory + history diffusion"
+        );
         println!("/hist [list | load <id> | delete <id>] — manage saved sessions");
         println!("/prompt chat|rewrite <file> | reset — load custom system prompts");
         println!("/log [off|error|warn|info|debug|trace] — show or change log verbosity");
@@ -1113,7 +1132,9 @@ impl Session {
             "/parser pdf unpdf|sink|extract|internal | epub epub — hot-swap parser per format"
         );
         println!("/profile save|show|load|list [name] — manage configuration profiles");
-        println!("/corpus <name> on|off — toggle a named document corpus (--corpus-dir / --corpus-urls); /corpus dyn on|off — dynamic web-download routing");
+        println!(
+            "/corpus <name> on|off — toggle a named document corpus (--corpus-dir / --corpus-urls); /corpus dyn on|off — dynamic web-download routing"
+        );
         println!("exit / quit     — end the session");
     }
 
@@ -1125,7 +1146,14 @@ impl Session {
             return Ok(());
         }
         info!("Searching Semantic Scholar for: {} ...", q);
-        match search_semantic_scholar(self.config.semantic_scholar_api_key.as_deref(), &self.http_client, q, 20).await {
+        match search_semantic_scholar(
+            self.config.semantic_scholar_api_key.as_deref(),
+            &self.http_client,
+            q,
+            20,
+        )
+        .await
+        {
             Ok(papers) if papers.is_empty() => {
                 println!("No papers found.");
             }
@@ -1195,10 +1223,19 @@ impl Session {
 
         if sub.is_empty() {
             println!("Vector search parameters:");
-            println!("  top-k:     {}  (change: /search topk <N>)", self.session.agent().top_k());
-            println!("  threshold: {:.3}  (change: /search threshold <F>)", self.session.agent().similarity_threshold());
+            println!(
+                "  top-k:     {}  (change: /search topk <N>)",
+                self.session.agent().top_k()
+            );
+            println!(
+                "  threshold: {:.3}  (change: /search threshold <F>)",
+                self.session.agent().similarity_threshold()
+            );
             if let Some(name) = self.session.agent().ranker_name() {
-                println!("  ranker:    {}  (change: /search rank <name> [key value]*)", name);
+                println!(
+                    "  ranker:    {}  (change: /search rank <name> [key value]*)",
+                    name
+                );
             } else {
                 println!("  ranker:    (opaque — store backend handles ranking)");
             }
@@ -1212,7 +1249,10 @@ impl Session {
                     self.session.agent_mut().set_top_k(n);
                     info!("Top-k set to {}.", n);
                 }
-                _ => println!("Usage: /search topk <N>  (current: {})", self.session.agent().top_k()),
+                _ => println!(
+                    "Usage: /search topk <N>  (current: {})",
+                    self.session.agent().top_k()
+                ),
             }
             return Ok(());
         }
@@ -1277,12 +1317,8 @@ impl Session {
                     }
                     Box::new(HybridRrfRanker { k })
                 }
-                "Cosine" | "cosine" => {
-                    Box::new(WeightedFusionRanker { alpha: 1.0 })
-                }
-                "BM25" | "bm25" => {
-                    Box::new(WeightedFusionRanker { alpha: 0.0 })
-                }
+                "Cosine" | "cosine" => Box::new(WeightedFusionRanker { alpha: 1.0 }),
+                "BM25" | "bm25" => Box::new(WeightedFusionRanker { alpha: 0.0 }),
                 "Weighted" | "weighted" => {
                     let mut alpha: f64 = 0.5;
                     for (key, val) in &params {
@@ -1313,9 +1349,8 @@ impl Session {
                         None => {
                             // Default inner: use current ranker name, fall back to RRFFusion.
                             let cur = self.session.agent().ranker_name().unwrap_or_default();
-                            build_default_ranker(&cur).unwrap_or_else(|| {
-                                Box::new(HybridRrfRanker::default())
-                            })
+                            build_default_ranker(&cur)
+                                .unwrap_or_else(|| Box::new(HybridRrfRanker::default()))
                         }
                     };
                     Box::new(MmrDiversityRanker { lambda, inner })
@@ -1345,7 +1380,10 @@ impl Session {
                         None => Box::new(HybridRrfRanker::default()),
                     };
                     let spec = match ChatAgentSpec::parse(
-                        &provider, Some(&model), api_key.as_deref(), None,
+                        &provider,
+                        Some(&model),
+                        api_key.as_deref(),
+                        None,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1396,7 +1434,9 @@ impl Session {
             let file = parts.next().unwrap_or("");
             if file.is_empty() {
                 println!("Usage: /search by <file>  — use a document as the search query");
-                println!("  Parses the file, chunks it, and finds similar documents in the database.");
+                println!(
+                    "  Parses the file, chunks it, and finds similar documents in the database."
+                );
                 return Ok(());
             }
             return self.cmd_search_by_doc(file).await;
@@ -1592,9 +1632,7 @@ impl Session {
                 Some(t) if t >= 0.0 => {
                     self.rebuild_chat_with_param(|p| p.temperature = Some(t));
                 }
-                _ => println!(
-                    "Usage: /chat temperature <F>  (0.0 = deterministic)"
-                ),
+                _ => println!("Usage: /chat temperature <F>  (0.0 = deterministic)"),
             }
             return Ok(());
         }
@@ -1603,9 +1641,7 @@ impl Session {
                 Some(p) if (0.0..=1.0).contains(&p) => {
                     self.rebuild_chat_with_param(|gp| gp.top_p = Some(p));
                 }
-                _ => println!(
-                    "Usage: /chat top_p <F>  (0.0–1.0)"
-                ),
+                _ => println!("Usage: /chat top_p <F>  (0.0–1.0)"),
             }
             return Ok(());
         }
@@ -1614,9 +1650,7 @@ impl Session {
                 Some(n) if n > 0 => {
                     self.rebuild_chat_with_param(|p| p.max_tokens = Some(n));
                 }
-                _ => println!(
-                    "Usage: /chat max_tokens <N>"
-                ),
+                _ => println!("Usage: /chat max_tokens <N>"),
             }
             return Ok(());
         }
@@ -1625,9 +1659,7 @@ impl Session {
                 Some(s) => {
                     self.rebuild_chat_with_param(|p| p.seed = Some(s));
                 }
-                _ => println!(
-                    "Usage: /chat seed <N>"
-                ),
+                _ => println!("Usage: /chat seed <N>"),
             }
             return Ok(());
         }
@@ -1638,7 +1670,9 @@ impl Session {
                 self.session.agent().chat_agent().model_name(),
                 self.session.agent().context_tokens(),
             );
-            println!("Usage: /chat <backend> [model] [api_key]  |  context <N>  |  temperature <F>  |  top_p <F>  |  max_tokens <N>  |  seed <N>");
+            println!(
+                "Usage: /chat <backend> [model] [api_key]  |  context <N>  |  temperature <F>  |  top_p <F>  |  max_tokens <N>  |  seed <N>"
+            );
             println!("  backends: ollama, deepseek");
             return Ok(());
         }
@@ -1760,7 +1794,11 @@ impl Session {
             // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
             for entry in self.corpora.iter().filter(|e| e.active) {
-                info!("Re-indexing corpus '{}' ({}).", entry.name, entry.kind.label());
+                info!(
+                    "Re-indexing corpus '{}' ({}).",
+                    entry.name,
+                    entry.kind.label()
+                );
                 match self
                     .session
                     .agent()
@@ -1791,7 +1829,12 @@ impl Session {
             let total_kb: u64 = stats.iter().map(|s| s.file_size_kb).sum();
             println!(
                 "\n{} files processed ({} ok, {} failed), {} chunks, {} chars, {} KB total.\n",
-                stats.len(), ok_count, fail_count, total_chunks, total_chars, total_kb
+                stats.len(),
+                ok_count,
+                fail_count,
+                total_chunks,
+                total_chars,
+                total_kb
             );
             if !stats.is_empty() {
                 println!(
@@ -1808,7 +1851,11 @@ impl Session {
                     if s.ok {
                         println!(
                             "{:<44} {:>6} {:>7} {:>8} {:>6.0}",
-                            name, s.file_size_kb, s.chunks, s.chars, s.avg_chars_per_chunk()
+                            name,
+                            s.file_size_kb,
+                            s.chunks,
+                            s.chars,
+                            s.avg_chars_per_chunk()
                         );
                     } else {
                         println!(
@@ -1827,7 +1874,10 @@ impl Session {
                     self.session.agent_mut().set_top_k(n);
                     info!("Top-k set to {}.", n);
                 }
-                _ => println!("Usage: /embed topk <N>  (current: {})", self.session.agent().top_k()),
+                _ => println!(
+                    "Usage: /embed topk <N>  (current: {})",
+                    self.session.agent().top_k()
+                ),
             }
             return Ok(());
         }
@@ -1892,7 +1942,11 @@ impl Session {
             println!("Chunker: {}", self.session.agent().chunker().name());
             println!(
                 "Available: {}",
-                available.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
+                available
+                    .iter()
+                    .map(|c| c.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             println!("Usage: /chunker <name>");
             return Ok(());
@@ -1913,7 +1967,11 @@ impl Session {
 
         let old = self.session.agent().chunker().name();
         self.session.agent_mut().set_chunker(new_chunker);
-        info!("Chunker: {} → {}", old, self.session.agent().chunker().name());
+        info!(
+            "Chunker: {} → {}",
+            old,
+            self.session.agent().chunker().name()
+        );
         // Provenance check: warn when the new pipeline is not indexed yet.
         self.pipeline_indexed().await;
         Ok(())
@@ -2015,10 +2073,7 @@ impl Session {
                 Ok(manifests) => {
                     println!("{} saved session(s):", manifests.len());
                     for m in &manifests {
-                        println!(
-                            "  {} — {} turns — {:?}",
-                            m.id.0, m.turn_count, m.created
-                        );
+                        println!("  {} — {} turns — {:?}", m.id.0, m.turn_count, m.created);
                     }
                 }
                 Err(e) => error!("Error listing sessions: {}", e),
@@ -2063,7 +2118,11 @@ impl Session {
         let arg = args_str.trim();
         if arg.is_empty() {
             // ── Current config ──────────────────────────────────────
-            let mem = if self.session.agent().rewriter().is_some() { "rewrite" } else { "off" };
+            let mem = if self.session.agent().rewriter().is_some() {
+                "rewrite"
+            } else {
+                "off"
+            };
             let diff = match self.session.history_strategy() {
                 Some(s) => s.name(),
                 None => "off",
@@ -2089,9 +2148,10 @@ impl Session {
             let count = self.session.turns().len();
             self.session.clear_turns();
             if let Some(rewriter) = self.session.agent().rewriter()
-                && let Err(e) = rewriter.clear_memory().await {
-                    warn!("Memory clear failed: {}", e);
-                }
+                && let Err(e) = rewriter.clear_memory().await
+            {
+                warn!("Memory clear failed: {}", e);
+            }
             info!("Conversation memory purged ({} entries removed).", count);
             return Ok(());
         }
@@ -2115,7 +2175,8 @@ impl Session {
         if arg.eq_ignore_ascii_case("log") {
             self.session.set_use_transcript(true);
             let old = self.session.history_strategy().map(|s| s.name());
-            self.session.set_history_strategy(Some(Box::new(LogHistory)));
+            self.session
+                .set_history_strategy(Some(Box::new(LogHistory)));
             match old {
                 Some("log") => {
                     info!("History diffusion unchanged: log");
@@ -2216,7 +2277,10 @@ impl Session {
                 "  chat (no docs): {:.80}",
                 self.session.agent().chat_without_docs_prompt().trim()
             );
-            println!("  rewrite:        {:.80}", self.session.agent().rewrite_prompt().trim());
+            println!(
+                "  rewrite:        {:.80}",
+                self.session.agent().rewrite_prompt().trim()
+            );
             println!("Usage: /prompt chat|rewrite <file>  or  /prompt reset");
             return Ok(());
         }
@@ -2227,14 +2291,16 @@ impl Session {
                     "You are a helpful document assistant. Answer the user's question \
                      explicitly using the provided Context snippets.\n\
                      \n\
-                     Context:\n{context}\n".to_string()
+                     Context:\n{context}\n"
+                        .to_string(),
                 );
                 self.session.agent_mut().set_rewrite_prompt(
                     "You are a query rewriter. Given the conversation and the \
                      latest question, produce a single self-contained search query \
                      that captures all relevant context. Output ONLY the rewritten \
                      query, nothing else.\n\n\
-                     Latest question: {question}".to_string()
+                     Latest question: {question}"
+                        .to_string(),
                 );
                 info!("Prompts reset to defaults.");
             }
@@ -2300,7 +2366,6 @@ impl Session {
 
         match format.to_lowercase().as_str() {
             "pdf" => {
-                #[allow(deprecated)]
                 let new = match choice.to_lowercase().as_str() {
                     #[cfg(feature = "kreuzberg")]
                     "kreuzberg" => PdfParserBackend::Kreuzberg,
@@ -2325,10 +2390,12 @@ impl Session {
                 // ingestion methods.
                 self.doc_parsers =
                     DocumentParsers::new(filtered_parsers(&new, self.config.parse.sloppy_pdf));
-                self.session.agent_mut().set_parsers(DocumentParsers::new(filtered_parsers(
-                    &new,
-                    self.config.parse.sloppy_pdf,
-                )));
+                self.session
+                    .agent_mut()
+                    .set_parsers(DocumentParsers::new(filtered_parsers(
+                        &new,
+                        self.config.parse.sloppy_pdf,
+                    )));
                 info!("Active parsers: {}", self.doc_parsers.names().join(", "));
                 // Provenance check: warn when the new parser has no chunks in
                 // the store yet — the user must run /embed index explicitly.
@@ -2387,11 +2454,15 @@ impl Session {
             match parts.next() {
                 None => {
                     let state = if self.dyn_corpora { "on" } else { "off" };
-                    println!("Dynamic routing (dyn) is {state}: /download and /get route into the first active URL corpus, else the first active directory corpus.");
+                    println!(
+                        "Dynamic routing (dyn) is {state}: /download and /get route into the first active URL corpus, else the first active directory corpus."
+                    );
                 }
                 Some("on") => {
                     self.dyn_corpora = true;
-                    println!("Dynamic routing is on — web downloads go to the first active URL corpus (else the first active directory corpus).");
+                    println!(
+                        "Dynamic routing is on — web downloads go to the first active URL corpus (else the first active directory corpus)."
+                    );
                 }
                 Some("off") => {
                     self.dyn_corpora = false;
@@ -2445,7 +2516,10 @@ impl Session {
         if self.corpora[idx].active {
             println!("Corpus '{name}' is already on — syncing for changes.");
         } else {
-            println!("Indexing corpus '{name}' ({})...", self.corpora[idx].kind.label());
+            println!(
+                "Indexing corpus '{name}' ({})...",
+                self.corpora[idx].kind.label()
+            );
         }
         let indexed = self.sync_corpus_entry(idx).await?;
         self.corpora[idx].active = true;
@@ -2508,11 +2582,13 @@ impl Session {
                 // before saving, so the profile reflects current runtime settings.
                 self.sync_config_from_agent();
                 self.config.save_to_profile(&self.config.workspace, name)?;
-                                println!("Profile '{}' saved.", name);
+                println!("Profile '{}' saved.", name);
             }
             "show" => {
-                let config = if name == "current" || parts.next().is_none() && name == "default"
-                    && RagrigConfig::list_profiles(&self.config.workspace)?.is_empty()
+                let config = if name == "current"
+                    || parts.next().is_none()
+                        && name == "default"
+                        && RagrigConfig::list_profiles(&self.config.workspace)?.is_empty()
                 {
                     self.sync_config_from_agent();
                     self.config.clone()
@@ -2539,19 +2615,21 @@ impl Session {
                 let workspace = self.config.workspace.clone();
                 self.config = profile;
                 self.config.workspace = workspace;
-                println!("Profile '{}' loaded. Use /chat, /embed, /memory to apply.", name);
+                println!(
+                    "Profile '{}' loaded. Use /chat, /embed, /memory to apply.",
+                    name
+                );
                 info!(
                     "Loaded profile '{}': chat={} embed={} memory={}",
-                    name,
-                    self.config.chat.model,
-                    self.config.embed.model,
-                    self.config.memory.model,
+                    name, self.config.chat.model, self.config.embed.model, self.config.memory.model,
                 );
             }
             _ => {
                 println!("Usage: /profile [save|show|load|list] [name]");
                 println!("  save <name>  — save current config as a profile");
-                println!("  show [name]  — display a profile as JSON (or 'current' for running state)");
+                println!(
+                    "  show [name]  — display a profile as JSON (or 'current' for running state)"
+                );
                 println!("  load <name>  — load a profile (use /chat, /embed, /memory to apply)");
                 println!("  list         — list saved profiles");
             }
@@ -2677,12 +2755,7 @@ impl Session {
 
         let response = if has_attachments {
             self.session
-                .chat_streaming_detailed_with_attachments(
-                    query,
-                    &attached,
-                    &on_token,
-                    Some(&token),
-                )
+                .chat_streaming_detailed_with_attachments(query, &attached, &on_token, Some(&token))
                 .await
         } else {
             self.session
@@ -2703,15 +2776,18 @@ impl Session {
                 }
                 trace!(
                     "Chunks retrieved: {:?}  |  Documents: {:?}",
-                    resp.chunks_retrieved,
-                    resp.documents
+                    resp.chunks_retrieved, resp.documents
                 );
                 trace!(
                     "System prompt ({} chars): {:.300}...",
                     resp.system_prompt.len(),
                     &resp.system_prompt[..300.min(resp.system_prompt.len())]
                 );
-                trace!("User prompt ({} chars): {}", resp.user_prompt.len(), resp.user_prompt);
+                trace!(
+                    "User prompt ({} chars): {}",
+                    resp.user_prompt.len(),
+                    resp.user_prompt
+                );
                 trace!("Elapsed: {:?}", resp.elapsed);
 
                 // Info header.
@@ -2904,9 +2980,10 @@ async fn main() -> Result<()> {
     // Auto‑save the session before exiting (skip empty transcripts so we
     // don't litter the store with blank session files).
     if !session.session.turns().is_empty()
-        && let Err(e) = session.session.save().await {
-            warn!("Failed to save session on exit: {}", e);
-        }
+        && let Err(e) = session.session.save().await
+    {
+        warn!("Failed to save session on exit: {}", e);
+    }
     session.rl.save_history(&session.history_path)?;
     Ok(())
 }
@@ -2938,15 +3015,14 @@ impl EscWatcher {
 
         // Switch to raw mode (no canonical line buffering, no echo) so ESC
         // arrives immediately instead of waiting for a newline.
-        let original = match tcgetattr(stdin)
+        let original = tcgetattr(stdin)
             .and_then(|orig| {
                 let mut raw = orig.clone();
-                raw.local_flags.remove(LocalFlags::ICANON | LocalFlags::ECHO);
+                raw.local_flags
+                    .remove(LocalFlags::ICANON | LocalFlags::ECHO);
                 tcsetattr(stdin, SetArg::TCSANOW, &raw).map(|_| orig)
-            }) {
-            Ok(orig) => Some(orig),
-            Err(_) => None,
-        };
+            })
+            .ok();
 
         let handle = original.as_ref().map(|_| {
             let shutdown = shutdown.clone();
@@ -2997,11 +3073,8 @@ impl Drop for EscWatcher {
         if let Some(original) = &self.original {
             use std::os::fd::{AsRawFd, BorrowedFd};
             let stdin = unsafe { BorrowedFd::borrow_raw(std::io::stdin().as_raw_fd()) };
-            let _ = nix::sys::termios::tcsetattr(
-                stdin,
-                nix::sys::termios::SetArg::TCSANOW,
-                original,
-            );
+            let _ =
+                nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, original);
         }
     }
 }
@@ -3045,9 +3118,7 @@ fn render_embed_progress(state: &EmbedProgress) {
 
 /// Build the closure-based [`ragrig::Progress`] reporter for one indexing
 /// run, sharing `state` between events.
-fn embed_progress_sink(
-    state: Arc<Mutex<EmbedProgress>>,
-) -> impl Fn(&ProgressEvent) + Send + Sync {
+fn embed_progress_sink(state: Arc<Mutex<EmbedProgress>>) -> impl Fn(&ProgressEvent) + Send + Sync {
     move |event: &ProgressEvent| {
         let mut st = state.lock().unwrap();
         match event {
@@ -3265,10 +3336,7 @@ mod tests {
     fn parse_corpora_duplicate_dir_name_errors() {
         let client = reqwest::Client::new();
         let err = parse_corpora(
-            &[
-                "docs=/a".to_string(),
-                "docs=/b".to_string(),
-            ],
+            &["docs=/a".to_string(), "docs=/b".to_string()],
             &[],
             &client,
         )
@@ -3299,24 +3367,16 @@ mod tests {
 
     #[test]
     fn resolve_folder_is_workspace_plus_corpus() {
-        let (ws, dirs) = resolve_workspace_and_corpora(
-            Some(&PathBuf::from("/data/docs")),
-            None,
-            vec![],
-            &[],
-        );
+        let (ws, dirs) =
+            resolve_workspace_and_corpora(Some(&PathBuf::from("/data/docs")), None, vec![], &[]);
         assert_eq!(ws, PathBuf::from("/data/docs"));
         assert_eq!(dirs, vec!["folder=/data/docs".to_string()]);
     }
 
     #[test]
     fn resolve_workspace_alone_has_no_implicit_corpus() {
-        let (ws, dirs) = resolve_workspace_and_corpora(
-            None,
-            Some(&PathBuf::from("/data/ws")),
-            vec![],
-            &[],
-        );
+        let (ws, dirs) =
+            resolve_workspace_and_corpora(None, Some(&PathBuf::from("/data/ws")), vec![], &[]);
         assert_eq!(ws, PathBuf::from("/data/ws"));
         assert!(dirs.is_empty());
     }
@@ -3361,10 +3421,7 @@ mod tests {
     #[test]
     fn route_dyn_off_goes_to_folder() {
         let corpora = vec![dir_entry("papers"), url_entry("arxiv")];
-        assert!(matches!(
-            pick_web_route(false, &corpora),
-            WebRoute::Folder
-        ));
+        assert!(matches!(pick_web_route(false, &corpora), WebRoute::Folder));
     }
 
     #[test]
@@ -3404,10 +3461,7 @@ mod tests {
         }
         // Everything inactive → folder.
         let corpora = vec![url, dir];
-        assert!(matches!(
-            pick_web_route(true, &corpora),
-            WebRoute::Folder
-        ));
+        assert!(matches!(pick_web_route(true, &corpora), WebRoute::Folder));
     }
 
     #[test]
@@ -3530,5 +3584,4 @@ mod tests {
             }
         }
     }
-
 }

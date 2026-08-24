@@ -20,7 +20,10 @@ pub async fn search_arxiv(
         limit
     );
 
-    let resp = http_client.get(&url).send().await
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| anyhow!("arXiv API request failed: {}", e))?;
 
     let body = resp.text().await?;
@@ -120,7 +123,9 @@ pub async fn search_semantic_scholar(
     if let Some(key) = api_key {
         request = request.header("x-api-key", key);
     }
-    let resp = request.send().await
+    let resp = request
+        .send()
+        .await
         .map_err(|e| anyhow!("Semantic Scholar API request failed: {}", e))?;
 
     let status = resp.status();
@@ -170,18 +175,33 @@ pub async fn search_semantic_scholar(
         url: Option<String>,
     }
 
-    let results: SearchResponse = serde_json::from_str(&body)
-        .map_err(|e| {
-            let preview: String = body.chars().take(500).collect();
-            anyhow!("Failed to parse Semantic Scholar response: {}\nRaw response (first 500 chars):\n{}", e, preview)
-        })?;
+    let results: SearchResponse = serde_json::from_str(&body).map_err(|e| {
+        let preview: String = body.chars().take(500).collect();
+        anyhow!(
+            "Failed to parse Semantic Scholar response: {}\nRaw response (first 500 chars):\n{}",
+            e,
+            preview
+        )
+    })?;
 
-    Ok(results.data.into_iter().map(|p| PaperResult {
-        title: p.title,
-        authors: p.authors.into_iter().map(|a| a.name).collect(),
-        year: p.year,
-        arxiv_id: if let Some(ext) = &p.external_ids { ext.arxiv.clone() } else { None },
-        doi: if let Some(ext) = &p.external_ids { ext.doi.clone() } else { None },
-        pdf_url: p.open_access_pdf.and_then(|oa| oa.url),
-    }).collect())
+    Ok(results
+        .data
+        .into_iter()
+        .map(|p| PaperResult {
+            title: p.title,
+            authors: p.authors.into_iter().map(|a| a.name).collect(),
+            year: p.year,
+            arxiv_id: if let Some(ext) = &p.external_ids {
+                ext.arxiv.clone()
+            } else {
+                None
+            },
+            doi: if let Some(ext) = &p.external_ids {
+                ext.doi.clone()
+            } else {
+                None
+            },
+            pdf_url: p.open_access_pdf.and_then(|oa| oa.url),
+        })
+        .collect())
 }
