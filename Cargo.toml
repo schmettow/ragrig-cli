@@ -2,6 +2,7 @@
 name = "ragrig-cli"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.89"
 description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
 license = "MIT"
 repository = "https://github.com/schmettow/ragrig-cli"
@@ -25,15 +26,17 @@ offline-mkl = ["ragrig/offline-mkl"]
 lancedb = ["ragrig/lancedb"]
 test-fixtures = ["ragrig/test-fixtures"]
 kreuzberg = ["ragrig/kreuzberg"]
+vision-pdf = ["ragrig/vision-pdf"]
 chunker-textsplitter = ["ragrig/chunker-textsplitter"]
 chunker-cognigraph = ["ragrig/chunker-cognigraph"]
-# `all` must enable the CLI-local features too: `internal-embed` and
-# `kreuzberg` gate match arms in main.rs, and `ragrig/all` alone does not
-# set the CLI's own feature flags.
+# `all` must enable the CLI-local features too: `internal-embed`,
+# `kreuzberg`, and `vision-pdf` gate match arms in main.rs, and
+# `ragrig/all` alone does not set the CLI's own feature flags.
 all = [
     "ragrig/all",
     "internal-embed",
     "kreuzberg",
+    "vision-pdf",
     "chunker-textsplitter",
     "chunker-cognigraph",
 ]

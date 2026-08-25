@@ -421,19 +421,17 @@ enum Command {
 
 // ── Bootstrap: build agents, index documents, enter REPL ───────────────────
 
-/// Linear initialisation of the entire RAG session.
-///
-/// 1. Builds the chat agent, embedding backend, and memory agent from
-///    configuration via their `*Spec` factories.
-/// 2. Opens or creates the vector store in the workspace directory.
-/// 3. Parses the named document corpora (`--corpus-dir` / `--corpus-urls`,
-///    plus the implicit `folder` corpus from `--folder` or the bare default)
-///    and syncs each active one into the store.
-/// 4. Constructs a [`Session`] carrying all state needed by the REPL.
-///
-/// This is the only place where the full pipeline is assembled —
-/// downstream code just calls `session.execute(cmd).await`.
-///
+/// The PDF backend names compiled into this build — drives the `/parser`
+/// usage strings so they never advertise a backend that is not there.
+fn pdf_backend_names() -> Vec<&'static str> {
+    let names = vec!["unpdf", "sink", "extract", "internal"];
+    #[cfg(feature = "kreuzberg")]
+    let names = [names.as_slice(), &["kreuzberg"]].concat();
+    #[cfg(feature = "vision-pdf")]
+    let names = [names.as_slice(), &["vision"]].concat();
+    names
+}
+
 /// Filter the parser list to include the selected PDF backend as primary,
 /// plus a panic-fallback (kreuzberg when available, otherwise sloppy-pdf).
 fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn DocumentParser>> {
@@ -444,7 +442,17 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
         PdfParserBackend::Sink => "pdfsink",
         PdfParserBackend::Extract => "pdf-extract",
         PdfParserBackend::Internal => "sloppy-pdf",
+        #[cfg(feature = "vision-pdf")]
         PdfParserBackend::Vision => "vision-pdf",
+        // Vision selected but the parser is not compiled in: fall back to
+        // the legacy default instead of leaving PDFs unparseable.
+        #[cfg(not(feature = "vision-pdf"))]
+        PdfParserBackend::Vision => {
+            log::warn!(
+                "vision-pdf selected but ragrig was built without the `vision-pdf` feature — falling back to pdf-extract"
+            );
+            "pdf-extract"
+        }
         // New backends added upstream: fall back to the legacy default.
         _ => "pdf-extract",
     };
@@ -542,6 +550,18 @@ fn parse_corpora(
     Ok(entries)
 }
 
+/// Linear initialisation of the entire RAG session.
+///
+/// 1. Builds the chat agent, embedding backend, and memory agent from
+///    configuration via their `*Spec` factories.
+/// 2. Opens or creates the vector store in the workspace directory.
+/// 3. Parses the named document corpora (`--corpus-dir` / `--corpus-urls`,
+///    plus the implicit `folder` corpus from `--folder` or the bare default)
+///    and syncs each active one into the store.
+/// 4. Constructs a [`Session`] carrying all state needed by the REPL.
+///
+/// This is the only place where the full pipeline is assembled —
+/// downstream code just calls `session.execute(cmd).await`.
 async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Result<Session> {
     // Build generation params from config.
     let chat_params = config.chat.params.clone();
@@ -2371,10 +2391,7 @@ impl Session {
         if format.is_empty() {
             println!("PDF:  {:?}", self.pdf_parser);
             println!("EPUB: {:?}", self.epub_parser);
-            #[cfg(feature = "kreuzberg")]
-            println!("Usage: /parser pdf unpdf|sink|extract|internal|vision|kreuzberg");
-            #[cfg(not(feature = "kreuzberg"))]
-            println!("Usage: /parser pdf unpdf|sink|extract|internal|vision");
+            println!("Usage: /parser pdf {}", pdf_backend_names().join("|"));
             println!("       /parser epub epub");
             return Ok(());
         }
@@ -2394,13 +2411,13 @@ impl Session {
                     "sink" => PdfParserBackend::Sink,
                     "extract" => PdfParserBackend::Extract,
                     "internal" => PdfParserBackend::Internal,
+                    #[cfg(feature = "vision-pdf")]
                     "vision" => PdfParserBackend::Vision,
                     other => {
-                        #[cfg(feature = "kreuzberg")]
-                        let hint = "unpdf, sink, extract, internal, vision, or kreuzberg";
-                        #[cfg(not(feature = "kreuzberg"))]
-                        let hint = "unpdf, sink, extract, internal, or vision";
-                        println!("Unknown PDF parser: {other}. Use {hint}.");
+                        println!(
+                            "Unknown PDF parser: {other}. Use {}.",
+                            pdf_backend_names().join(", ")
+                        );
                         return Ok(());
                     }
                 };
