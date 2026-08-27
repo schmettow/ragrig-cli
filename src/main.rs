@@ -2053,6 +2053,7 @@ impl Session {
                 parser: Some(parser.to_string()),
                 chunker: Some(chunker.to_string()),
                 embedder: Some(embedder_id.clone()),
+                pipeline: None,
             };
             if self.session.agent().store().count_matching(&filter).await == 0 {
                 missing.push(format!("{ext} ({parser})"));
@@ -2091,6 +2092,7 @@ impl Session {
             parser: Some(parser.to_string()),
             chunker: Some(chunker.to_string()),
             embedder: Some(embedder_id.clone()),
+            pipeline: None,
         };
         if self.session.agent().store().count_matching(&filter).await > 0 {
             return Ok(());
