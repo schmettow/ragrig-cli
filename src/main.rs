@@ -1341,8 +1341,13 @@ impl Session {
             fn build_default_ranker(name: &str) -> Option<Box<dyn Ranker>> {
                 match name {
                     "RRFFusion" | "rrffusion" => Some(Box::new(HybridRrfRanker::default())),
-                    "Cosine" | "cosine" => Some(Box::new(WeightedFusionRanker { alpha: 1.0 })),
-                    "BM25" | "bm25" => Some(Box::new(WeightedFusionRanker { alpha: 0.0 })),
+                    // Hardcoded alphas are always valid.
+                    "Cosine" | "cosine" => Some(Box::new(
+                        WeightedFusionRanker::new(1.0).expect("alpha 1.0 is valid"),
+                    )),
+                    "BM25" | "bm25" => Some(Box::new(
+                        WeightedFusionRanker::new(0.0).expect("alpha 0.0 is valid"),
+                    )),
                     "Weighted" | "weighted" => Some(Box::new(WeightedFusionRanker::default())),
                     _ => None,
                 }
@@ -1356,10 +1361,20 @@ impl Session {
                             k = val.parse::<f64>().unwrap_or(60.0);
                         }
                     }
-                    Box::new(HybridRrfRanker { k })
+                    match HybridRrfRanker::new(k) {
+                        Ok(r) => Box::new(r),
+                        Err(e) => {
+                            println!("Invalid k: {e}");
+                            return Ok(());
+                        }
+                    }
                 }
-                "Cosine" | "cosine" => Box::new(WeightedFusionRanker { alpha: 1.0 }),
-                "BM25" | "bm25" => Box::new(WeightedFusionRanker { alpha: 0.0 }),
+                "Cosine" | "cosine" => {
+                    Box::new(WeightedFusionRanker::new(1.0).expect("alpha 1.0 is valid"))
+                }
+                "BM25" | "bm25" => {
+                    Box::new(WeightedFusionRanker::new(0.0).expect("alpha 0.0 is valid"))
+                }
                 "Weighted" | "weighted" => {
                     let mut alpha: f64 = 0.5;
                     for (key, val) in &params {
@@ -1367,7 +1382,13 @@ impl Session {
                             alpha = val.parse::<f64>().unwrap_or(0.5);
                         }
                     }
-                    Box::new(WeightedFusionRanker { alpha })
+                    match WeightedFusionRanker::new(alpha) {
+                        Ok(r) => Box::new(r),
+                        Err(e) => {
+                            println!("Invalid alpha: {e}");
+                            return Ok(());
+                        }
+                    }
                 }
                 "MMR" | "mmr" => {
                     let mut lambda: f64 = 0.5;
@@ -1394,7 +1415,13 @@ impl Session {
                                 .unwrap_or_else(|| Box::new(HybridRrfRanker::default()))
                         }
                     };
-                    Box::new(MmrDiversityRanker { lambda, inner })
+                    match MmrDiversityRanker::new(lambda, inner) {
+                        Ok(r) => Box::new(r),
+                        Err(e) => {
+                            println!("Invalid lambda: {e}");
+                            return Ok(());
+                        }
+                    }
                 }
                 "LLM" | "llm" => {
                     let mut inner_name: Option<String> = None;
