@@ -42,7 +42,8 @@ all = [
 ]
 
 [dependencies]
-ragrig = { path = "../ragrig" }
+# ragrig = { path = "../ragrig" }
+ragrig = {version = "1"}
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
