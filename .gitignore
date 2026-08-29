@@ -1,1 +1,7 @@
 /target
+
+# Runtime state written by the REPL when the working directory is used as
+# the workspace — regenerated freely, never part of the crate tarball.
+/.ragrig/
+/.ragrig_history
+/.ragrig_store
