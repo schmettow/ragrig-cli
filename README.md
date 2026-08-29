@@ -6,25 +6,25 @@ A terminal-based Retrieval-Augmented Generation REPL built on the
 [`ragrig`](https://crates.io/crates/ragrig) library.  Index your document
 collection once, then chat with it — PDF, EPUB, DOCX, and HTML supported.
 
-**Designed for students.**  The default build compiles with zero external
-dependencies — no C++ toolchain, no `cmake`, no `protoc`.  Install Rust,
-install Ollama, run `cargo install ragrig-cli`, and you're done.
+**Designed for students.**  
+  Easy to install. Default build compiles with zero external dependencies. Install Ollama, run `cargo install ragrig-cli`, and call `ragrig-cli --folder mypaper/literature`.
 
-> This is the **binary crate**.  If you want the library for building your
-> own application, see [`ragrig`](https://crates.io/crates/ragrig).
+> This is the **binary crate** providing a RAG chat console.  If you want to roll your own RAG application
+> see [`ragrig`](https://crates.io/crates/ragrig).
 
 - **Zero extra dependencies** — default build is pure Rust; Ollama provides
   models at runtime
-- **Hot-swappable** — switch chat, memory, or embedding engines mid-session
-  without losing document index or conversation context
-- **Hybrid retrieval** — BM25 + cosine vector similarity with Reciprocal
-  Rank Fusion.  Hot-swap ranking algorithms (RRF, weighted, MMR, LLM re-rank)
+- **Deepseek** support, if you need some heavy lifting
 - **Paper search** — built-in arXiv and Semantic Scholar integration with
   one-command PDF download
 - **Session persistence** — auto-save conversations, reload past sessions
 - **Profile management** — save/load complete configs as JSON for different
   project contexts
 - **Cross-platform** — Linux, macOS, WSL, and Windows (MSVC / MinGW)
+- - **Hot-swappable** — switch chat, memory, or embedding engines mid-session
+  without losing document index or conversation context
+- **Hybrid retrieval** — BM25 + cosine vector similarity with Reciprocal
+  Rank Fusion.  Hot-swap ranking algorithms (RRF, weighted, MMR, LLM re-rank)
 
 ---
 
@@ -52,7 +52,7 @@ This downloads and compiles the latest release from
 [crates.io](https://crates.io/crates/ragrig-cli).  The binary ends up in
 `~/.cargo/bin/ragrig-cli` — make sure that directory is on your `PATH`.
 
-### Or build from source
+### Or get it from Github
 
 ragrig-cli builds against the `ragrig` library, which must sit next to it:
 
@@ -80,8 +80,21 @@ Subsequent launches are instant — only changed files are re-indexed.
 Query > What are the key findings about forced-choice paradigms?
 ```
 
-> **Students:** if you only have Rust and Ollama installed, you already have
-> everything you need.  The default build adds nothing else.
+### Demo mode
+
+Try ragrig against a real book without any of your own documents:
+
+```bash
+ragrig-cli --demo
+```
+
+Demo mode pins the small `llama3.2:3b` chat model with a 4096-token context
+(comfortably fits an 8 GB GPU), disables memory, and indexes the embedded
+HTML fixture book — Martin Schmettow, *New Statistics for Design
+Researchers. A Bayesian workflow in tidy R.*
+(https://schmettow.github.io/New_Stats/) — then prefills the first question
+("What is Bayesian Statistics?").  It requires the Ollama models
+`nomic-embed-text:latest` and `llama3.2:3b`.
 
 ### Hybrid Search Tuning
 
@@ -184,7 +197,7 @@ meta-analysis.  We discussed how they differ from fixed-effect
 models …
 ```
 
-**Pure chat — no document search, no memory, cloud-only:**
+**One shot questions — no document search, no memory, cloud-only:**
 
 ```
 Query > /embed none
@@ -490,7 +503,11 @@ If ragrig-cli reports `OllamaUnreachable`, work through these in order:
 
 This happens, when the context size of local Ollama models exceeds the hard VRAM limits. See below for closer explanations.
 
-If you really need a larger context size, switch to a cloud model (or get a GPU with 24GB+ VRAM).
+If you really need a large context size and a powerful model, you have the following option: 
+
++ switch to a cloud model
++ get a GPU with 24GB+ VRAM
++ get a computer with good amounts of unified memory
 
 ### When the context size exceeds the model's maximum, how can I adjust this?
 

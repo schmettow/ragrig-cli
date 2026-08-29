@@ -126,6 +126,13 @@ struct Cli {
     #[arg(long, env = "SEMANTIC_SCHOLAR_API_KEY")]
     pub semantic_scholar_api_key: Option<String>,
 
+    /// Start in demo mode: the small llama3.2:3b chat model with a 4096-token
+    /// context (fits an 8 GB GPU), memory off, and the embedded HTML fixture
+    /// book as the document corpus, with a prefilled first question.
+    #[cfg(feature = "test-fixtures")]
+    #[arg(long)]
+    pub demo: bool,
+
     #[command(flatten)]
     pub chat: CliChatConfig,
     #[command(flatten)]
@@ -2922,13 +2929,54 @@ impl Session {
     }
 }
 
+// ── Demo mode ───────────────────────────────────────────────────────────────
+
+/// The chat model `--demo` uses: ~2.2 GB at Q4, so it sits on an 8 GB GPU
+/// with plenty of headroom for the 4096-token context and KV cache
+/// (https://localaimaster.com/vram/best-ollama-models-8gb-vram).
+const DEMO_CHAT_MODEL: &str = "llama3.2:3b";
+
+/// The first question `--demo` prefills into the prompt line.
+const DEMO_FIRST_QUESTION: &str = "What is Bayesian Statistics?";
+
+/// `--demo` startup: pin the small chat model with a 4096-token context and
+/// swap the implicit corpus for the embedded HTML fixture book.  Returns the
+/// fixture `TempDir`, kept alive for the lifetime of the process.
+#[cfg(feature = "test-fixtures")]
+fn apply_demo_setup(
+    demo: bool,
+    had_explicit_corpora: bool,
+    config: &mut RagrigConfig,
+) -> Result<Option<tempfile::TempDir>> {
+    if !demo {
+        return Ok(None);
+    }
+    let (fixture_dir, tmp) = ragrig::fixtures::extract_fixtures("html")?;
+    let mut corpora = vec![format!("book={}", fixture_dir.display())];
+    if had_explicit_corpora {
+        corpora.append(&mut config.corpus_dirs);
+    }
+    config.corpus_dirs = corpora;
+    config.chat.model = DEMO_CHAT_MODEL.into();
+    config.chat.context_tokens = 4096;
+    Ok(Some(tmp))
+}
+
 // ── main: parse → bootstrap → central match loop ──────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(feature = "test-fixtures")]
+    let demo = cli.demo;
+    #[cfg(not(feature = "test-fixtures"))]
+    let demo = false;
+    // Explicit corpora survive demo mode; the implicit `folder=.` corpus does not.
+    let had_explicit_corpora = !cli.corpus_dirs.is_empty() || !cli.corpus_urls.is_empty();
     let profile_name = cli.profile.clone();
-    let cli_config: RagrigConfig = cli.into();
+    let mut cli_config: RagrigConfig = cli.into();
+    #[cfg(feature = "test-fixtures")]
+    let _demo_fixtures = apply_demo_setup(demo, had_explicit_corpora, &mut cli_config)?;
 
     // If --profile was given, load it and merge CLI overrides on top.
     let config = if let Some(ref name) = profile_name {
@@ -3007,8 +3055,38 @@ async fn main() -> Result<()> {
 
     let mut session = bootstrap(config, stderr_level).await?;
 
+    if demo {
+        // Memory off: no query rewriting, no transcript accumulation — every
+        // question stands alone (the `/memory off` behaviour).
+        session.session.agent_mut().set_rewriter(None);
+        session.session.set_use_transcript(false);
+        session.session.clear_turns();
+        println!("Welcome to ragrig demo mode!");
+        println!();
+        println!("This session answers questions about the book:");
+        println!(
+            "  Martin Schmettow, New Statistics for Design Researchers. A Bayesian workflow in tidy R."
+        );
+        println!("  https://schmettow.github.io/New_Stats/");
+        println!();
+        println!(
+            "Demo mode requires the Ollama models 'nomic-embed-text:latest' and '{DEMO_CHAT_MODEL}'."
+        );
+        println!("Memory is off — every question is independent.");
+        println!();
+        println!("Press Enter to run the prefilled question, or edit it first.");
+    }
+
+    let mut first_prompt = demo;
     loop {
-        let readline = session.rl.readline("Query > ");
+        let readline = if first_prompt {
+            first_prompt = false;
+            session
+                .rl
+                .readline_with_initial("Query > ", (DEMO_FIRST_QUESTION, ""))
+        } else {
+            session.rl.readline("Query > ")
+        };
 
         let cmd = match readline {
             Ok(line) => {

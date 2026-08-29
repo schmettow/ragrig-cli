@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--demo`** — start in demo mode: the small `llama3.2:3b` chat model with
+  a 4096-token context (fits an 8 GB GPU), memory off, the embedded HTML
+  fixture book (Martin Schmettow, *New Statistics for Design Researchers*,
+  https://schmettow.github.io/New_Stats/) as the document corpus, a greeting
+  listing the required Ollama models, and the first question prefilled in
+  the prompt line.  Behind the `test-fixtures` feature (on by default).
 - **`/chunker [name]`** — show or hot-swap the chunking strategy.  Every
   stored chunk records which (parser, chunker, embedder) pipeline built it;
   swapping to a pipeline that has no chunks in the store prints a warning

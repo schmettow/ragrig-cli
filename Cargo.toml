@@ -11,7 +11,7 @@ keywords = ["rag", "llm", "repl", "ollama"]
 categories = ["command-line-utilities", "science"]
 
 [features]
-default = ["internal", "ollama-embed"]
+default = ["internal", "ollama-embed", "test-fixtures"]
 internal = ["ragrig/internal"]
 ollama-embed = ["ragrig/ollama-embed"]
 internal-embed = ["ragrig/internal-embed"]
@@ -69,6 +69,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3"
 urlencoding = "2"
 
 # ── Error handling ──────────────────────────────────────────────────────
