@@ -1,9 +1,51 @@
+# Roadmap
+
+Planned work for upcoming versions.  Entries describe intended
+non-breaking changes until they ship in a release.
+
+## v1.1.0: Refactoring the REPL logic
+
+**Goal:** improve platform independence and bring Cancel function back to native windows builds.
+
+The REPL currently hand-rolls two pieces of terminal infrastructure:
+
+- **ESC-cancel watcher** — raw-mode stdin watching built on `nix`
+  (termios + poll) with a background thread.  Unix-only; native Windows
+  gets a no-op stub (v1.0.1).
+- **Embedding progress bar** — a fixed-width bar drawn manually with
+  `\r` and ANSI codes.
+
+**Plan:** migrate both to purpose-built, cross-platform crates:
+
+- **crossterm** for raw mode and key events.  Its async `EventStream`
+  integrates with the existing tokio streaming and would make
+  ESC-cancel available on native Windows as well.
+- **indicatif** for the progress bar (auto-hides when the output is
+  not a TTY).
+
+This migration must be **non-breaking**: same commands, same output
+format, same cancellation semantics, existing history/session files
+keep working and same data format.
+
+
 # Changelog
 
 All notable changes to ragrig-cli are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.1]
+
+### Fixed
+
+- **Windows MSVC builds** — the ESC-cancel watcher used `nix` (termios +
+  poll) and `std::os::fd`, which do not exist on Windows, so the crate
+  failed to compile for `x86_64-pc-windows-msvc`.  The watcher is now
+  compiled on Unix only; native Windows builds get an inert no-op stub
+  and simply run operations to completion (ESC cancellation is
+  currently unavailable there — noted in the README).  `nix` is now a
+  `cfg(unix)`-only dependency.
 
 ## [1.0.0]
 

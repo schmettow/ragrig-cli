@@ -1,6 +1,6 @@
 [package]
 name = "ragrig-cli"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.89"
 description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
