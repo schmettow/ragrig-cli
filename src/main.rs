@@ -3142,14 +3142,21 @@ async fn main() -> Result<()> {
 /// rustyline owns the terminal while reading a line, so the watcher is only
 /// ever active between `readline` calls — the two never overlap.  When stdin
 /// is not a TTY (piped input), the watcher degrades to an inactive no-op.
+///
+/// Unix only: on non-Unix platforms (Windows) this is a no-op stub — ESC
+/// cancellation is currently unavailable there.
 struct EscWatcher {
+    #[cfg(unix)]
     handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(unix)]
     original: Option<nix::sys::termios::Termios>,
+    #[cfg(unix)]
     shutdown: Arc<AtomicBool>,
 }
 
 impl EscWatcher {
     /// Spawn the watcher.  Never fails: without a TTY it just stays inactive.
+    #[cfg(unix)]
     fn spawn(token: CancellationToken) -> Self {
         use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
         use std::os::fd::{AsRawFd, BorrowedFd};
@@ -3205,8 +3212,15 @@ impl EscWatcher {
             shutdown,
         }
     }
+
+    /// Stub for platforms without termios support: never cancels.
+    #[cfg(not(unix))]
+    fn spawn(_token: CancellationToken) -> Self {
+        Self {}
+    }
 }
 
+#[cfg(unix)]
 impl Drop for EscWatcher {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -3222,6 +3236,11 @@ impl Drop for EscWatcher {
                 nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, original);
         }
     }
+}
+
+#[cfg(not(unix))]
+impl Drop for EscWatcher {
+    fn drop(&mut self) {}
 }
 
 /// Aggregate state for the embedding progress bar.
@@ -3256,8 +3275,12 @@ fn render_embed_progress(state: &EmbedProgress) {
         String::new()
     };
     eprint!(
-        "\r\x1b[2K{bar} {}/{} files | {} chunks{failed} | {} (ESC: cancel)",
-        state.started, state.total, state.chunks, state.current
+        "\r\x1b[2K{bar} {}/{} files | {} chunks{failed} | {}{}",
+        state.started,
+        state.total,
+        state.chunks,
+        state.current,
+        if cfg!(unix) { " (ESC: cancel)" } else { "" }
     );
 }
 

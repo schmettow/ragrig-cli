@@ -131,6 +131,8 @@ Query > /search threshold 0.08       # stricter semantic filter
   token count (`--- 5 chunks | 132 tokens from [a.pdf] in 2.1s ---`).
 - Press **ESC** while an answer is generating (or while documents are being
   indexed) to cancel the operation; the terminal is restored afterwards.
+  This currently works on Unix-like systems only — native Windows builds do
+  not support ESC cancellation yet, and operations run to completion there.
 - Indexing (bootstrap, `/embed index`, `/corpus <name> on`) renders a live
   progress bar with files processed, chunks embedded, and failures:
   `[####----] 7/12 files | 341 chunks | papers/a.pdf (ESC: cancel)`.
