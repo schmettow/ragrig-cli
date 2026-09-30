@@ -267,7 +267,7 @@ under a pipeline that has not been indexed yet is an error.
 | Command | Action |
 |---|---|
 | Any text | RAG query against your document pool |
-| `/attach <file>` | Attach a document for the next query (one-shot, not indexed) |
+| `/attach <file>` | Attach a document for the next query — PDF/EPUB/DOCX/HTML/MD via their parsers, or any other UTF-8 text file (e.g. `.bib`) read as-is (one-shot, not indexed) |
 | `/attach` | Show currently attached files |
 | `/attach clear` | Clear all attachments |
 | `/download <url>` | Download and ingest a document by URL |

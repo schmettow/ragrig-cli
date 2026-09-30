@@ -35,6 +35,18 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`/attach` accepts any UTF-8 text file** — files whose extension has no
+  registered document parser (BibTeX `.bib`, `.txt`, `.csv`, …) are now read
+  directly as UTF-8 text and injected into the next query, instead of being
+  rejected with "No document parser registered".  Formats with a registered
+  parser (PDF, EPUB, DOCX, HTML, Markdown) keep going through the parser
+  pipeline, and a parse failure there remains a hard error — there is no
+  silent fallback to raw bytes.
+
 ## [1.0.1]
 
 ### Fixed

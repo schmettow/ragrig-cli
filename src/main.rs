@@ -485,6 +485,33 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
     list
 }
 
+/// Resolve an attached file to text for the next query.
+///
+/// Files whose extension has a registered [`DocumentParser`] go through the
+/// normal parser pipeline (PDF, EPUB, DOCX, HTML, Markdown).  Attachments
+/// are prompt-only — never chunked or embedded — so any other file is read
+/// directly as UTF-8 text instead of being rejected: BibTeX, plain text,
+/// CSV, and similar formats reach the model unchanged.  Files with a
+/// registered format stay strict: a parse failure there is a real error,
+/// not a cue to fall back to raw bytes.
+fn resolve_attachment_text(parsers: &DocumentParsers, path: &std::path::Path) -> Result<String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if parsers.primary_name_for(ext).is_some() {
+        return ragrig::extract_text(parsers, path);
+    }
+    let format = if ext.is_empty() {
+        "files without an extension".to_string()
+    } else {
+        format!(".{ext}")
+    };
+    fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "no parser registered for {format} and the file could not be read as \
+             UTF-8 text: {e}"
+        )
+    })
+}
+
 /// Parse the `name=value` command-line corpus specs into document corpora.
 ///
 /// - `--corpus-dir name=path`  → a [`FolderCorpus`] named `name`.
@@ -884,12 +911,13 @@ impl Session {
 
     // ── /attach <file> ─────────────────────────────────────────────────
 
-    /// Parse a file into text and store it as an attachment for the next
+    /// Resolve a file to text and store it as an attachment for the next
     /// RAG query.  The attachment is one-shot: it is cleared after the
     /// next query (unless re-attached).
     ///
     /// Usage:
-    ///   /attach <file>            — attach a PDF, EPUB, DOCX, HTML, or MD file
+    ///   /attach <file>            — attach a PDF, EPUB, DOCX, HTML or MD file,
+    ///                               or any other UTF-8 text file (e.g. .bib)
     ///   /attach                  — show currently attached files
     ///   /attach clear            — clear all attachments
     async fn cmd_attach(&mut self, file_path: &str) -> Result<()> {
@@ -923,8 +951,10 @@ impl Session {
             return Ok(());
         }
 
-        // Parse the file using the existing document parsers.
-        match ragrig::extract_text(&self.doc_parsers, path) {
+        // Registered formats go through their parsers; unknown extensions
+        // (BibTeX, plain text, CSV, …) are read as UTF-8 text — see
+        // `resolve_attachment_text`.
+        match resolve_attachment_text(&self.doc_parsers, path) {
             Ok(text) => {
                 let name = path
                     .file_name()
@@ -3690,6 +3720,43 @@ mod tests {
         assert!(!token.is_cancelled());
         drop(watcher);
         assert!(!token.is_cancelled());
+    }
+
+    // ── resolve_attachment_text ──────────────────────────────────────
+
+    #[test]
+    fn attachment_unregistered_extension_reads_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CEH.bib");
+        let bibtex = "@article{smith2024,\n  title = {A Study},\n  author = {Smith, Jane},\n}";
+        std::fs::write(&path, bibtex).unwrap();
+        let parsers = DocumentParsers::new(ragrig::build_parsers());
+        let text = resolve_attachment_text(&parsers, &path).unwrap();
+        assert_eq!(text, bibtex, "BibTeX must reach the prompt unchanged");
+    }
+
+    #[test]
+    fn attachment_registered_format_does_not_fall_back_to_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.md");
+        std::fs::write(&path, "").unwrap();
+        let parsers = DocumentParsers::new(ragrig::build_parsers());
+        // MarkdownParser rejects empty files; a registered format must
+        // report that error instead of silently reading the raw bytes.
+        assert!(resolve_attachment_text(&parsers, &path).is_err());
+    }
+
+    #[test]
+    fn attachment_unregistered_binary_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.dat");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let parsers = DocumentParsers::new(ragrig::build_parsers());
+        let err = resolve_attachment_text(&parsers, &path).unwrap_err();
+        assert!(
+            err.to_string().contains("no parser registered"),
+            "expected a no-parser error, got: {err}"
+        );
     }
 
     // ── Integration test ─────────────────────────────────────────────
