@@ -15,6 +15,8 @@ use ragrig::{
     scan_document_files, search_by_document,
 };
 use ragrig::{parsers, store};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::fs;
@@ -22,6 +24,7 @@ use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tracing::Level;
 use tracing_appender::rolling;
 use tracing_subscriber::filter::filter_fn;
@@ -719,22 +722,22 @@ async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Resu
         info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
         let token = CancellationToken::new();
         let watcher = EscWatcher::spawn(token.clone());
-        let state = Arc::new(Mutex::new(EmbedProgress::default()));
-        let sink = embed_progress_sink(state);
+        let bar = embed_progress_bar();
+        let sink = embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
         match agent
             .sync_corpus_with_progress(entry.as_corpus(), Some(&sink), Some(&token))
             .await
         {
             Ok(_) => {}
             Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
-                eprint!("\r\x1b[2K");
+                bar.finish_and_clear();
                 eprintln!("Indexing cancelled — exiting.");
                 return Err(e);
             }
             Err(e) => return Err(e),
         }
         drop(watcher);
-        eprint!("\r\x1b[2K");
+        bar.finish_and_clear();
     }
 
     let row_count = agent.store().len();
@@ -1893,8 +1896,8 @@ impl Session {
 
             let token = CancellationToken::new();
             let watcher = EscWatcher::spawn(token.clone());
-            let state = Arc::new(Mutex::new(EmbedProgress::default()));
-            let sink = embed_progress_sink(state);
+            let bar = embed_progress_bar();
+            let sink = embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
 
             // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
@@ -1912,7 +1915,7 @@ impl Session {
                 {
                     Ok(stats) => all_stats.extend(stats),
                     Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
-                        eprint!("\r\x1b[2K");
+                        bar.finish_and_clear();
                         info!("Indexing cancelled.");
                         return Ok(());
                     }
@@ -1920,7 +1923,7 @@ impl Session {
                 }
             }
             drop(watcher);
-            eprint!("\r\x1b[2K");
+            bar.finish_and_clear();
             info!(
                 "Re-indexing complete. Store size: {} chunks.",
                 self.session.agent().store().len()
@@ -2597,15 +2600,15 @@ impl Session {
     async fn sync_corpus_entry(&mut self, idx: usize) -> Result<usize> {
         let token = CancellationToken::new();
         let watcher = EscWatcher::spawn(token.clone());
-        let state = Arc::new(Mutex::new(EmbedProgress::default()));
-        let sink = embed_progress_sink(state);
+        let bar = embed_progress_bar();
+        let sink = embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
         let result = self
             .session
             .agent()
             .sync_corpus_with_progress(self.corpora[idx].as_corpus(), Some(&sink), Some(&token))
             .await;
         drop(watcher);
-        eprint!("\r\x1b[2K");
+        bar.finish_and_clear();
         Ok(result?.len())
     }
 
@@ -3165,92 +3168,59 @@ async fn main() -> Result<()> {
 
 // ── ESC watcher + embedding progress bar ──────────────────────────────────
 
-/// Watches stdin for the ESC byte (0x1b) while an operation runs and flips
-/// the cancellation token when it arrives.  Puts the terminal into raw mode
-/// for its lifetime and restores it on drop.
+/// Watches stdin for the ESC key while an operation runs and flips the
+/// cancellation token when it arrives.  Puts the terminal into raw mode
+/// (via crossterm) for its lifetime and restores it on drop.
 ///
 /// rustyline owns the terminal while reading a line, so the watcher is only
 /// ever active between `readline` calls — the two never overlap.  When stdin
 /// is not a TTY (piped input), the watcher degrades to an inactive no-op.
 ///
-/// Unix only: on non-Unix platforms (Windows) this is a no-op stub — ESC
-/// cancellation is currently unavailable there.
+/// Key events come from crossterm, which abstracts the platform input
+/// handling, so this works on Unix and native Windows alike.
 struct EscWatcher {
-    #[cfg(unix)]
     handle: Option<std::thread::JoinHandle<()>>,
-    #[cfg(unix)]
-    original: Option<nix::sys::termios::Termios>,
-    #[cfg(unix)]
     shutdown: Arc<AtomicBool>,
 }
 
 impl EscWatcher {
     /// Spawn the watcher.  Never fails: without a TTY it just stays inactive.
-    #[cfg(unix)]
     fn spawn(token: CancellationToken) -> Self {
-        use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-        use std::os::fd::{AsRawFd, BorrowedFd};
-
-        let stdin_fd = std::io::stdin().as_raw_fd();
-        let stdin = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Switch to raw mode (no canonical line buffering, no echo) so ESC
-        // arrives immediately instead of waiting for a newline.
-        let original = tcgetattr(stdin)
-            .and_then(|orig| {
-                let mut raw = orig.clone();
-                raw.local_flags
-                    .remove(LocalFlags::ICANON | LocalFlags::ECHO);
-                tcsetattr(stdin, SetArg::TCSANOW, &raw).map(|_| orig)
-            })
-            .ok();
+        // Raw mode (no canonical line buffering, no echo) so ESC arrives
+        // immediately instead of waiting for a newline.  Without a TTY this
+        // fails and the watcher stays inert.
+        let raw_ok = crossterm::terminal::enable_raw_mode().is_ok();
 
-        let handle = original.as_ref().map(|_| {
+        let handle = raw_ok.then(|| {
             let shutdown = shutdown.clone();
             std::thread::spawn(move || {
-                use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-                let mut fds = [PollFd::new(stdin, PollFlags::POLLIN)];
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    match poll(&mut fds, PollTimeout::from(100u16)) {
-                        Ok(0) => continue, // timeout — re-check shutdown
-                        Ok(_) => {
-                            let mut buf = [0u8; 16];
-                            match nix::unistd::read(stdin, &mut buf) {
-                                Ok(0) => return, // EOF — nothing to watch
-                                Ok(n) => {
-                                    if buf[..n].contains(&0x1b) {
-                                        token.cancel();
-                                        return;
-                                    }
-                                }
-                                Err(_) => return,
+                    match event::poll(Duration::from_millis(100)) {
+                        Ok(true) => {
+                            if let Ok(Event::Key(key)) = event::read()
+                                && key.code == KeyCode::Esc
+                                && !matches!(key.kind, KeyEventKind::Release)
+                            {
+                                token.cancel();
+                                return;
                             }
                         }
+                        Ok(false) => continue, // timeout — re-check shutdown
                         Err(_) => return,
                     }
                 }
             })
         });
 
-        Self {
-            handle,
-            original,
-            shutdown,
-        }
-    }
-
-    /// Stub for platforms without termios support: never cancels.
-    #[cfg(not(unix))]
-    fn spawn(_token: CancellationToken) -> Self {
-        Self {}
+        Self { handle, shutdown }
     }
 }
 
-#[cfg(unix)]
 impl Drop for EscWatcher {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -3259,64 +3229,37 @@ impl Drop for EscWatcher {
         {
             // The watcher thread cannot panic by construction; ignore.
         }
-        if let Some(original) = &self.original {
-            use std::os::fd::{AsRawFd, BorrowedFd};
-            let stdin = unsafe { BorrowedFd::borrow_raw(std::io::stdin().as_raw_fd()) };
-            let _ =
-                nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, original);
-        }
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
-#[cfg(not(unix))]
-impl Drop for EscWatcher {
-    fn drop(&mut self) {}
-}
-
-/// Aggregate state for the embedding progress bar.
+/// Aggregate state for the embedding progress-bar message (bar geometry —
+/// position and length — is tracked by indicatif itself).
 #[derive(Default)]
 struct EmbedProgress {
-    total: usize,
-    started: usize,
-    done: usize,
     chunks: usize,
     failed: usize,
     current: String,
 }
 
-/// Draw the one-line embedding progress bar to stderr (overwritten with
-/// `\r` on the next event; cleared by printing `\r\x1b[2K`).
-fn render_embed_progress(state: &EmbedProgress) {
-    const WIDTH: usize = 30;
-    let frac = if state.total > 0 {
-        (state.started as f64 / state.total as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let filled = (frac * WIDTH as f64) as usize;
-    let bar = format!(
-        "[{}{}]",
-        "#".repeat(filled),
-        "-".repeat(WIDTH.saturating_sub(filled))
+/// Create the one-line embedding progress bar.  indicatif draws it to
+/// stderr and hides it automatically when stderr is not a TTY.
+fn embed_progress_bar() -> ProgressBar {
+    let bar = ProgressBar::new(0);
+    bar.set_style(
+        ProgressStyle::with_template("[{bar:30}] {pos}/{len} files | {msg} (ESC: cancel)")
+            .expect("static progress template is valid")
+            .progress_chars("##-"),
     );
-    let failed = if state.failed > 0 {
-        format!(" | {} failed", state.failed)
-    } else {
-        String::new()
-    };
-    eprint!(
-        "\r\x1b[2K{bar} {}/{} files | {} chunks{failed} | {}{}",
-        state.started,
-        state.total,
-        state.chunks,
-        state.current,
-        if cfg!(unix) { " (ESC: cancel)" } else { "" }
-    );
+    bar
 }
 
 /// Build the closure-based [`ragrig::Progress`] reporter for one indexing
-/// run, sharing `state` between events.
-fn embed_progress_sink(state: Arc<Mutex<EmbedProgress>>) -> impl Fn(&ProgressEvent) + Send + Sync {
+/// run, feeding the indicatif bar and sharing message state between events.
+fn embed_progress_sink(
+    bar: ProgressBar,
+    state: Arc<Mutex<EmbedProgress>>,
+) -> impl Fn(&ProgressEvent) + Send + Sync {
     move |event: &ProgressEvent| {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         match event {
@@ -3326,18 +3269,23 @@ fn embed_progress_sink(state: Arc<Mutex<EmbedProgress>>) -> impl Fn(&ProgressEve
                 corpus,
                 document,
             } => {
-                st.total = *total;
-                st.started = *index + 1;
+                bar.set_length(*total as u64);
+                bar.set_position((*index + 1) as u64);
                 st.current = format!("{corpus}/{document}");
             }
             ProgressEvent::FileChunked { .. } | ProgressEvent::FileEmbedded { .. } => {}
             ProgressEvent::ChunksEmbedded { done, .. } => st.chunks = *done,
-            ProgressEvent::FileStored => st.done += 1,
+            ProgressEvent::FileStored => {}
             ProgressEvent::FileFailed { .. } => st.failed += 1,
             // `ProgressEvent` is #[non_exhaustive] — future variants are ignored.
             _ => {}
         }
-        render_embed_progress(&st);
+        let failed = if st.failed > 0 {
+            format!(" | {} failed", st.failed)
+        } else {
+            String::new()
+        };
+        bar.set_message(format!("{} chunks | {}{}", st.chunks, st.current, failed));
     }
 }
 

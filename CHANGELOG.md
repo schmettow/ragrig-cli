@@ -3,30 +3,6 @@
 Planned work for upcoming versions.  Entries describe intended
 non-breaking changes until they ship in a release.
 
-## v1.1.0: Refactoring the REPL logic
-
-**Goal:** improve platform independence and bring Cancel function back to native windows builds.
-
-The REPL currently hand-rolls two pieces of terminal infrastructure:
-
-- **ESC-cancel watcher** — raw-mode stdin watching built on `nix`
-  (termios + poll) with a background thread.  Unix-only; native Windows
-  gets a no-op stub (v1.0.1).
-- **Embedding progress bar** — a fixed-width bar drawn manually with
-  `\r` and ANSI codes.
-
-**Plan:** migrate both to purpose-built, cross-platform crates:
-
-- **crossterm** for raw mode and key events.  Its async `EventStream`
-  integrates with the existing tokio streaming and would make
-  ESC-cancel available on native Windows as well.
-- **indicatif** for the progress bar (auto-hides when the output is
-  not a TTY).
-
-This migration must be **non-breaking**: same commands, same output
-format, same cancellation semantics, existing history/session files
-keep working and same data format.
-
 ## v1.2.0: Adding basic reference management
 
 **Goal** Improve quality of citations in generated text
@@ -43,6 +19,26 @@ All notable changes to ragrig-cli are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.1.0]
+
+### Changed
+
+- **Cross-platform REPL UI (crossterm + indicatif)** — the hand-rolled
+  terminal plumbing was replaced by purpose-built, cross-platform crates:
+
+  - **ESC-cancel watcher** now reads key events via crossterm (raw mode
+    plus `event::poll`/`event::read`), replacing the Unix-only `nix`
+    termios/poll implementation and its Windows no-op stub.  ESC-cancel
+    therefore works on native Windows again, and the `nix` dependency
+    is gone.
+  - **Embedding progress bar** is now rendered by indicatif with the
+    same `[####----] 7/12 files | 341 chunks | … (ESC: cancel)` format,
+    and it auto-hides when the output is not a TTY (no more `\r`
+    garbage in piped/CI logs).
+
+  Non-breaking: same commands, output format, and cancellation
+  semantics; history and session files are unchanged.
 
 ## v1.0.2
 

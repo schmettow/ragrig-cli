@@ -48,6 +48,11 @@ ragrig = {version = "1"}
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
 rustyline = "18.0"
+# Cross-platform terminal control: raw mode plus low-level key events
+# for the ESC-cancel watcher (replaces the Unix-only nix termios code).
+crossterm = "0.29"
+# Progress bar for indexing — auto-hides when stderr is not a TTY.
+indicatif = "0.18"
 
 # ── Async runtime ───────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
@@ -70,10 +75,3 @@ urlencoding = "2"
 
 # ── Error handling ──────────────────────────────────────────────────────
 anyhow = "1.0"
-
-[target.'cfg(unix)'.dependencies]
-# Raw-mode stdin watching for the ESC-cancels feature (termios) and
-# its non-blocking read loop (poll) — Unix only; on Windows the ESC
-# watcher is a no-op stub.  Already a transitive dependency of
-# rustyline; kept minimal with default-features off.
-nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
