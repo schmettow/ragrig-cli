@@ -7366,6 +7366,7 @@ dependencies = [
  "log",
  "ragrig",
  "reqwest 0.13.4",
+ "rustix",
  "rustyline",
  "serde",
  "serde_json",

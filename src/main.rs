@@ -3240,9 +3240,59 @@ async fn main() -> Result<()> {
 
 // ── ESC watcher + embedding progress bar ──────────────────────────────────
 
+/// Puts the terminal into a minimal "cbreak" mode for the watcher's
+/// lifetime: key input is delivered immediately and without echo, but output
+/// post-processing is left intact so streamed `\n` still maps to `\r\n`.
+///
+/// On Unix this clears only `ICANON`/`ECHO` via rustix — crossterm's
+/// `enable_raw_mode` would also clear `OPOST` and mangle streamed output.
+/// On other platforms (Windows) crossterm's raw mode is safe because it only
+/// touches the console's input flags.
+struct RawInputGuard {
+    #[cfg(unix)]
+    original: rustix::termios::Termios,
+}
+
+impl RawInputGuard {
+    /// Enter raw-input mode.  `None` when stdin is not a TTY.
+    fn enter() -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+            let fd = rustix::stdio::stdin();
+            let original = tcgetattr(fd).ok()?;
+            let mut termios = original.clone();
+            termios
+                .local_modes
+                .remove(LocalModes::ICANON | LocalModes::ECHO);
+            tcsetattr(fd, OptionalActions::Now, &termios).ok()?;
+            Some(Self { original })
+        }
+        #[cfg(not(unix))]
+        {
+            crossterm::terminal::enable_raw_mode().ok()?;
+            Some(Self {})
+        }
+    }
+}
+
+impl Drop for RawInputGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use rustix::termios::{tcsetattr, OptionalActions};
+            let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &self.original);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
 /// Watches stdin for the ESC key while an operation runs and flips the
-/// cancellation token when it arrives.  Puts the terminal into raw mode
-/// (via crossterm) for its lifetime and restores it on drop.
+/// cancellation token when it arrives.  Enters raw-input mode (see
+/// [`RawInputGuard`]) for its lifetime and restores the terminal on drop.
 ///
 /// rustyline owns the terminal while reading a line, so the watcher is only
 /// ever active between `readline` calls — the two never overlap.  When stdin
@@ -3253,19 +3303,16 @@ async fn main() -> Result<()> {
 struct EscWatcher {
     handle: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    guard: Option<RawInputGuard>,
 }
 
 impl EscWatcher {
     /// Spawn the watcher.  Never fails: without a TTY it just stays inactive.
     fn spawn(token: CancellationToken) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let guard = RawInputGuard::enter();
 
-        // Raw mode (no canonical line buffering, no echo) so ESC arrives
-        // immediately instead of waiting for a newline.  Without a TTY this
-        // fails and the watcher stays inert.
-        let raw_ok = crossterm::terminal::enable_raw_mode().is_ok();
-
-        let handle = raw_ok.then(|| {
+        let handle = guard.as_ref().map(|_| {
             let shutdown = shutdown.clone();
             std::thread::spawn(move || {
                 loop {
@@ -3289,7 +3336,11 @@ impl EscWatcher {
             })
         });
 
-        Self { handle, shutdown }
+        Self {
+            handle,
+            shutdown,
+            guard,
+        }
     }
 }
 
@@ -3301,7 +3352,8 @@ impl Drop for EscWatcher {
         {
             // The watcher thread cannot panic by construction; ignore.
         }
-        let _ = crossterm::terminal::disable_raw_mode();
+        // Restore the terminal (RawInputGuard::drop; no-op without a TTY).
+        drop(self.guard.take());
     }
 }
 

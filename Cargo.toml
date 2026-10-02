@@ -75,3 +75,10 @@ urlencoding = "2"
 
 # ── Error handling ──────────────────────────────────────────────────────
 anyhow = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+# Unix-only "cbreak" terminal setup for the ESC-cancel watcher.  crossterm's
+# enable_raw_mode disables output post-processing (OPOST), which would stop
+# `\n` from mapping to `\r\n` and mangle streamed output; rustix lets us
+# clear just ICANON|ECHO instead.
+rustix = { version = "1.1", features = ["termios"] }
