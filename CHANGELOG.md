@@ -27,6 +27,15 @@ This migration must be **non-breaking**: same commands, same output
 format, same cancellation semantics, existing history/session files
 keep working and same data format.
 
+## v1.2.0: Adding basic reference management
+
+**Goal** Improve quality of citations in generated text
+
+Currently, the LLM chat agent sees the embeddinqs as chunks with provenance as an identifier. If this is a cryptic filename, the agent fails to generate proper citations.
+
+Basic reference management means that references are automatically extracted from the corpus and introduced as meta data to the embeddings. 
+
+
 
 # Changelog
 
