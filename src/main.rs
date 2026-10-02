@@ -2692,25 +2692,17 @@ impl Session {
                 println!("Profile '{}' saved.", name);
             }
             "show" => {
-                let config = if name == "current"
-                    || parts.next().is_none()
-                        && name == "default"
-                        && RagrigConfig::list_profiles(&self.config.workspace)?.is_empty()
-                {
+                // Bare `/profile show` (and `show current`) prints the live
+                // running state; a named profile is loaded from disk.
+                let config = if name == "current" || (name == "default" && parts.next().is_none()) {
                     self.sync_config_from_agent();
                     self.config.clone()
                 } else {
                     match RagrigConfig::load_from_profile(&self.config.workspace, name) {
                         Ok(c) => c,
                         Err(e) => {
-                            // Try showing the current in-memory config if named profile not found.
-                            if name == "current" {
-                                self.sync_config_from_agent();
-                                self.config.clone()
-                            } else {
-                                println!("{}", e);
-                                return Ok(());
-                            }
+                            println!("{}", e);
+                            return Ok(());
                         }
                     }
                 };
@@ -2722,10 +2714,9 @@ impl Session {
                 let workspace = self.config.workspace.clone();
                 self.config = profile;
                 self.config.workspace = workspace;
-                println!(
-                    "Profile '{}' loaded. Use /chat, /embed, /memory to apply.",
-                    name
-                );
+                // Apply the loaded parameters to the running agents.
+                self.apply_config().await?;
+                println!("Profile '{}' loaded and applied.", name);
                 info!(
                     "Loaded profile '{}': chat={} embed={} memory={}",
                     name, self.config.chat.model, self.config.embed.model, self.config.memory.model,
@@ -2737,8 +2728,89 @@ impl Session {
                 println!(
                     "  show [name]  — display a profile as JSON (or 'current' for running state)"
                 );
-                println!("  load <name>  — load a profile (use /chat, /embed, /memory to apply)");
+                println!("  load <name>  — load a profile and apply its settings to the running session");
                 println!("  list         — list saved profiles");
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the in-memory `self.config` to the running session — chat
+    /// agent, embedding backend, retrieval tuning, context budget, and the
+    /// memory model (when memory is on).  Mirrors the hot-swap commands;
+    /// the vector store and the conversation transcript are untouched.
+    async fn apply_config(&mut self) -> Result<()> {
+        let params = self.config.chat.params.clone();
+
+        // Chat agent.
+        let chat_spec = match self.config.chat.provider {
+            Provider::Ollama => {
+                ChatAgentSpec::ollama(self.config.chat.model.clone(), params.clone(), None)
+            }
+            Provider::Deepseek => ChatAgentSpec::deepseek(
+                self.config.chat.deepseek_model.clone(),
+                self.config.chat.deepseek_api_key.clone(),
+                params.clone(),
+                None,
+            ),
+            // New providers added upstream: fall back to Ollama.
+            _ => ChatAgentSpec::ollama(self.config.chat.model.clone(), params.clone(), None),
+        };
+        match chat_spec.build() {
+            Ok(agent) => {
+                self.session.agent_mut().set_chat_agent(agent);
+                info!(
+                    "Chat agent applied: {} ({})",
+                    self.session.agent().chat_agent().backend_name(),
+                    self.session.agent().chat_agent().model_name()
+                );
+            }
+            Err(e) => RagrigError::log_or(&e, "Failed to rebuild chat agent"),
+        }
+        self.session
+            .agent_mut()
+            .set_context_tokens(self.config.chat.context_tokens);
+
+        // Embedding backend + retrieval tuning.
+        let embedder_spec = match self.config.embed.provider {
+            EmbeddingProvider::Ollama => EmbedderSpec::Ollama {
+                model: self.config.embed.model.clone(),
+                request_timeout_secs: None,
+            },
+            #[cfg(feature = "internal-embed")]
+            EmbeddingProvider::Fastembed => EmbedderSpec::Fastembed,
+            // New embedding backends added upstream: fall back to Ollama.
+            _ => EmbedderSpec::Ollama {
+                model: self.config.embed.model.clone(),
+                request_timeout_secs: None,
+            },
+        };
+        match embedder_spec.build() {
+            Ok(embedder) => {
+                self.session.agent_mut().set_embedder(embedder);
+                info!(
+                    "Embedder applied: {} ({})",
+                    self.session.agent().embedder().backend_name(),
+                    self.session.agent().embedder().model_name()
+                );
+                // Provenance check: warn when the new embedder has no chunks yet.
+                self.pipeline_indexed().await;
+            }
+            Err(e) => RagrigError::log_or(&e, "Failed to rebuild embedder"),
+        }
+        self.session.agent_mut().set_top_k(self.config.embed.top_k);
+        self.session
+            .agent_mut()
+            .set_similarity_threshold(self.config.embed.similarity_threshold);
+
+        // Memory model — only rebuild when a rewriter is active; whether
+        // memory is on/off is runtime state, not part of the profile.
+        if self.session.agent().rewriter().is_some() {
+            let memory_spec =
+                ChatAgentSpec::ollama(self.config.memory.model.clone(), params.clone(), None);
+            match memory_spec.build() {
+                Ok(agent) => self.session.agent_mut().set_rewriter(Some(agent)),
+                Err(e) => RagrigError::log_or(&e, "Failed to rebuild memory agent"),
             }
         }
         Ok(())

@@ -359,7 +359,7 @@ ragrig-cli --folder ~/papers --profile physics --model gemma4:e4b
 |---|---|
 | `/profile save <name>` | Serialise current config (including runtime hot-swaps) to `.ragrig/profiles/<name>.json` |
 | `/profile show [name]`  | Pretty-print a profile as JSON.  `show current` prints the live running state. |
-| `/profile load <name>`   | Load a profile into memory without restarting agents — use `/chat`, `/embed`, `/memory` afterwards to apply it. |
+| `/profile load <name>`   | Load a profile and apply its settings to the running session — chat model and generation params, embedding backend, top-k, similarity threshold, context budget, and the memory model (when memory is on).  The vector store and transcript are untouched. |
 | `/profile list`          | List all saved profile names. |
 
 Profiles are stored under `<workspace>/.ragrig/profiles/`.  The JSON is
