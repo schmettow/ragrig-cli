@@ -89,31 +89,88 @@ Query > What are the key findings about forced-choice paradigms?
 
 Chunk provenance — including the file name — is embedded with the text, so a
 cryptic name like `paper_v2_final.pdf` gives the chat agent nothing to cite.
-With the optional `grobid` feature, ragrig can parse each PDF's header with a
-running [GROBID](https://grobid.readthedocs.io/) server, complete the
-metadata against OpenAlex, and rename the file to
-`Author1, Author2, ... - Year - Full title` (all authors, punctuation stripped
-from the title) before it is indexed.
+With the optional `grobid` feature, ragrig parses each PDF's header with a
+running [GROBID](https://grobid.readthedocs.io/) server, completes the
+metadata against OpenAlex, and renames the file to
+
+```text
+Author1, Author2, ... - Year - Full title
+```
+
+before it is indexed. Syntax characters are stripped from every part, so
+`The B.A.R.C. model: for continuous variables!` becomes
+`The BARC model for continuous variables`, and diacritics are kept:
+`Milašauskienė, Žemyna - 2003 - Changes of patients satisfaction with the
+health care services.pdf`.
+When two records would produce the same name, the year is numbered —
+`... - 2020 - Title.pdf`, `... - 2020-1 - Title.pdf`, `... - 2020-2 -
+Title.pdf` — so authors and title keep their place.
+
+#### Prerequisites
+
+- **Docker** (recommended) or a native GROBID installation — GROBID is a
+  Java application. The
+  [GROBID README](https://github.com/kermitt2/grobid#readme) and the
+  [Docker guide](https://grobid.readthedocs.io/en/latest/Grobid-docker/)
+  document the precise procedure, image tags and alternatives (there is also
+  an [install-from-source guide](https://grobid.readthedocs.io/en/latest/Install-Grobid/)).
+- **Memory**: the CRF-only image runs in roughly 4 GB; the `-full` image with
+  the deep-learning models is several GB larger and benefits from a GPU.
+- **Startup time**: GROBID preloads its models on start, so the first
+  `/api/isalive` can take tens of seconds. ragrig waits for the server
+  (5 probes, 3 s apart) before reporting it as unreachable.
+- **Network access for OpenAlex**: the completion tier looks references up
+  on `api.openalex.org` (no API key). Lookup failures are non-fatal and leave
+  the metadata GROBID parsed.
+
+#### Running a GROBID container
 
 ```bash
-# Start a GROBID server (Docker), then install/build with the feature:
-docker run --rm -p 8070:8070 grobid/grobid:0.9.1-crf
+# CRF models (small, fast — usually a good default):
+docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.1-crf
 
+# Deep-learning models (better header/reference parsing; GPU recommended):
+docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.1-full
+```
+
+Check that the server is up (`true` once ready):
+
+```bash
+curl http://localhost:8070/api/isalive
+```
+
+Then build/install ragrig with the feature and run it against the folder:
+
+```bash
 cargo install ragrig-cli --features grobid
 ragrig-cli --folder ~/Documents/papers --embed-rename
 ```
 
-- `--grobid-url <URL>` points at the server (default `http://localhost:8070`).
-- `--grobid-workers <N>` bounds concurrent GROBID/OpenAlex requests (default 4).
+#### Example
+
+```text
+$ ragrig-cli --folder ~/papers --embed-rename
+INFO GROBID pre-pass: 2 PDF(s) in /home/me/papers — parsing headers, completing against OpenAlex, renaming to Author1, Author2 - Year - Full title (4 worker(s)).
+INFO GROBID: renamed /home/me/papers/paper_v2_final.pdf → /home/me/papers/Kahle, Brewster - 2000 - The Barc model for continuous variables.pdf
+INFO GROBID: renamed /home/me/papers/scan_0012.pdf → /home/me/papers/Milašauskienė, Žemyna - 2003 - Changes of patients satisfaction with the health care services.pdf
+INFO GROBID pre-pass done: 2 of 2 PDF(s) renamed, 1 OpenAlex-completed, 0 failed.
+```
+
+- `--grobid-url <URL>` points at the server (default `http://localhost:8070`),
+  e.g. a remote or shared instance; `--grobid-workers <N>` bounds concurrent
+  GROBID/OpenAlex requests (default 4).
+- The pre-pass runs at startup, when a directory corpus is switched on
+  (`/corpus <name> on`), before `/embed index`, and after `/download` or
+  `/get` saves a file into a directory corpus or into the main folder.
+  Documents added to a URL corpus are fetched directly and have no local
+  file, so there is nothing to rename.
 - Processed files are fingerprinted in `.ragrig_grobid.json` in the corpus
-  folder, so the parse and lookup pass only runs for new or changed PDFs.
+  folder, so the expensive parse/lookup pass only runs for new or changed
+  PDFs.
 - Failures degrade gracefully: an unparseable PDF keeps its name and is still
   indexed, a failed OpenAlex lookup keeps the GROBID metadata, and a failed
   rename keeps the original path.  Only an unreachable GROBID server aborts
   startup.
-
-The pre-pass also runs when a directory corpus is switched on (`/corpus <name>
-on`) and before `/embed index`, so runtime additions are renamed as well.
 
 ### Demo mode
 

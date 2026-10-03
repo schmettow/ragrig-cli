@@ -1161,19 +1161,37 @@ impl Session {
                 if self.dyn_corpora && !self.corpora.is_empty() {
                     println!("Note: no active named corpora — adding to the main folder.");
                 }
-                let chunk_cfg = self.session.agent().chunk_config();
-                ragrig::download_and_ingest_url_with_chunker(
-                    self.session.agent().embedder(),
-                    self.session.agent().parsers(),
-                    &self.config.workspace,
-                    &chunk_cfg,
-                    &self.http_client,
-                    self.session.agent().store(),
-                    url,
-                    Some(DEFAULT_MAX_DOWNLOAD_BYTES),
-                    self.session.agent().chunker(),
-                )
-                .await
+                let folder = self.config.workspace.clone();
+                let (bytes, filename, _content_type) =
+                    ragrig::fetch_url(&self.http_client, url, Some(DEFAULT_MAX_DOWNLOAD_BYTES))
+                        .await?;
+                let dest = folder.join(&filename);
+                std::fs::write(&dest, &bytes)
+                    .with_context(|| format!("failed to save '{}'", dest.display()))?;
+                // The main folder is indexed as the "folder" corpus, so the
+                // GROBID pre-pass applies here just like to a named
+                // directory corpus.
+                grobid::rename_pdfs(self.grobid_rename.as_ref(), &folder).await?;
+                let corpus = FolderCorpus::named("folder", &folder);
+                let token = CancellationToken::new();
+                let watcher = EscWatcher::spawn(token.clone());
+                let bar = embed_progress_bar();
+                let sink = embed_progress_sink(
+                    bar.clone(),
+                    Arc::new(Mutex::new(EmbedProgress::default())),
+                );
+                let result = self
+                    .session
+                    .agent()
+                    .sync_corpus_with_progress(&corpus, Some(&sink), Some(&token))
+                    .await;
+                drop(watcher);
+                bar.finish_and_clear();
+                result?;
+                Ok(format!(
+                    "Added '{filename}' to the document pool ({} bytes).",
+                    bytes.len()
+                ))
             }
         }
     }

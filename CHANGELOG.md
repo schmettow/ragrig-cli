@@ -33,9 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   title.  `--grobid-url` (default `http://localhost:8070`) and
   `--grobid-workers` (default 4) configure the pre-pass; processed files are
   fingerprinted in `.ragrig_grobid.json` so the parse/lookup pass only runs
-  for new or changed PDFs.  Build with
+  for new or changed PDFs.  Colliding names are deduplicated by numbering
+  the year (`... - 2020-1 - Title.pdf`).  The pre-pass also runs after
+  `/download` and `/get` save a file into the main folder, and waits up to
+  15 s for a cold GROBID container.  Build with
   `cargo install ragrig-cli --features grobid`; without the feature,
-  `--embed-rename` reports how to enable it.
+  `--embed-rename` reports how to enable it.  The README documents the
+  container setup with links to the GROBID instructions.
 
 ## [1.1.0]
 

@@ -81,10 +81,11 @@ mod imp {
     const MANIFEST_NAME: &str = ".ragrig_grobid.json";
 
     /// Number of liveness probes before giving up on the server.
-    const PROBE_ATTEMPTS: usize = 3;
+    const PROBE_ATTEMPTS: usize = 5;
 
-    /// Delay between liveness probes.
-    const PROBE_DELAY: Duration = Duration::from_secs(1);
+    /// Delay between liveness probes; a cold GROBID container can take a
+    /// while to preload its models.
+    const PROBE_DELAY: Duration = Duration::from_secs(3);
 
     /// Per-request timeout for OpenAlex lookups, so an unreachable API host
     /// cannot stall a worker for the OS TCP timeout.
@@ -142,6 +143,7 @@ mod imp {
 
         let client = GrobidClient::new(&cfg.url)
             .with_context(|| format!("invalid GROBID server URL {:?}", cfg.url))?;
+        info!("GROBID pre-pass: waiting for the server at {} ...", cfg.url);
         client
             .wait_until_ready(PROBE_ATTEMPTS, PROBE_DELAY)
             .await
@@ -263,7 +265,12 @@ mod imp {
                 }
                 Some(target) if target == original => original,
                 Some(target) => {
-                    let target = bibtex::unique_path(target);
+                    // Colliding names get a counter on the year, so authors
+                    // and title keep their place in the name.
+                    let target = bibtex::unique_path_with_year(
+                        target,
+                        bibtex::year(&results[index].biblio).as_deref(),
+                    );
                     match fs::rename(&original, &target) {
                         Ok(()) => {
                             info!(
@@ -449,12 +456,48 @@ mod imp {
         }
 
         #[test]
-        fn collision_gets_suffix() {
+        fn collision_gets_year_suffix() {
             let dir = tempfile::tempdir().unwrap();
-            let target = dir.path().join("Smith_2020_Title.pdf");
+            let target = dir.path().join("Smith - 2020 - Title.pdf");
             fs::write(&target, b"").unwrap();
-            let free = bibtex::unique_path(target);
-            assert_eq!(free.file_name().unwrap(), "Smith_2020_Title-2.pdf");
+            let free = bibtex::unique_path_with_year(target, Some("2020"));
+            assert_eq!(free.file_name().unwrap(), "Smith - 2020-1 - Title.pdf");
+        }
+
+        #[test]
+        fn rename_all_numbers_the_year_on_collisions() {
+            // Two records with the same authors, year and title must not
+            // overwrite each other: the second gets `2020-1`.
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("a.pdf");
+            let second = dir.path().join("b.pdf");
+            fs::write(&first, b"pdf").unwrap();
+            fs::write(&second, b"pdf").unwrap();
+            let mut results = vec![
+                Processed {
+                    path: first,
+                    biblio: biblio(Some("Smith"), Some("2020"), Some("Same title")),
+                },
+                Processed {
+                    path: second,
+                    biblio: biblio(Some("Smith"), Some("2020"), Some("Same title")),
+                },
+            ];
+            let mut manifest = Manifest::default();
+            assert_eq!(rename_all(&mut results, dir.path(), &mut manifest), 2);
+
+            let mut names: Vec<String> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    "Smith - 2020 - Same title.pdf",
+                    "Smith - 2020-1 - Same title.pdf"
+                ]
+            );
         }
 
         #[test]
@@ -610,6 +653,9 @@ mod imp {
             let dir = tempfile::tempdir().unwrap();
             let pdf = dir.path().join("scan.pdf");
             fs::write(&pdf, b"%PDF-1.4 fake").unwrap();
+            // A second PDF with the same metadata forces the collision path.
+            let colliding = dir.path().join("scan2.pdf");
+            fs::write(&colliding, b"%PDF-1.4 fake").unwrap();
 
             let addr = spawn_mock_grobid(MOCK_TEI).await;
             let cfg = GrobidRenameConfig {
@@ -620,12 +666,21 @@ mod imp {
 
             let renamed = dir.path().join("Smith, Jones - 2020 - Tiny.pdf");
             assert!(renamed.exists(), "expected {renamed:?} to exist");
-            assert!(!pdf.exists(), "the original file must be renamed");
+            // The collision is resolved by numbering the year, so the title
+            // stays at the end of both names.
+            let numbered = dir.path().join("Smith, Jones - 2020-1 - Tiny.pdf");
+            assert!(numbered.exists(), "expected {numbered:?} to exist");
+            assert!(!pdf.exists(), "the first original file must be renamed");
+            assert!(
+                !colliding.exists(),
+                "the second original file must be renamed"
+            );
 
             // The fingerprint manifest turns the second run into a no-op; it
             // returns before contacting the server again.
             let manifest = Manifest::load(dir.path());
             assert!(manifest.is_unchanged(dir.path(), &renamed));
+            assert!(manifest.is_unchanged(dir.path(), &numbered));
             rename_pdfs(&cfg, dir.path())
                 .await
                 .expect("second pre-pass");
@@ -640,7 +695,7 @@ mod imp {
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
                 })
                 .count();
-            assert_eq!(pdf_count, 1);
+            assert_eq!(pdf_count, 2);
         }
     }
 }
