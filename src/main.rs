@@ -31,7 +31,9 @@ use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 
+mod grobid;
 mod search;
+use grobid::GrobidRenameConfig;
 use search::{search_arxiv, search_semantic_scholar};
 
 // ── CLI parsing (binary-only) ──────────────────────────────────────────────
@@ -130,6 +132,19 @@ struct Cli {
     pub corpus_urls: Vec<String>,
     #[arg(long, env = "SEMANTIC_SCHOLAR_API_KEY")]
     pub semantic_scholar_api_key: Option<String>,
+
+    /// Before indexing a directory corpus, parse every PDF with a GROBID
+    /// server, complete its header metadata against OpenAlex, and rename the
+    /// file to `Author_Year_Title` (title truncated to 10 words).  Requires
+    /// a build with the `grobid` cargo feature and a running GROBID server.
+    #[arg(long)]
+    pub embed_rename: bool,
+    /// GROBID server base URL used by `--embed-rename`.
+    #[arg(long, default_value = "http://localhost:8070", value_name = "URL")]
+    pub grobid_url: String,
+    /// Maximum number of concurrent GROBID/OpenAlex requests.
+    #[arg(long, default_value = "4", value_name = "N")]
+    pub grobid_workers: usize,
 
     /// Start in demo mode: the small llama3.2:3b chat model with a 4096-token
     /// context (fits an 8 GB GPU), memory off, and the embedded HTML fixture
@@ -397,6 +412,9 @@ struct Session {
     /// Named document corpora (`--corpus-dir` / `--corpus-urls`), toggled
     /// with `/corpus <name> on|off`.
     corpora: Vec<CorpusEntry>,
+    /// GROBID pre-pass (`--embed-rename`): parse PDF headers, complete them
+    /// against OpenAlex, and rename files before indexing a directory corpus.
+    grobid_rename: Option<GrobidRenameConfig>,
     /// Dynamic routing for web downloads (`/corpus dyn on|off`).  When on,
     /// `/download` and `/get` route documents into the first active URL
     /// corpus (else the first active directory corpus) instead of the main
@@ -608,7 +626,11 @@ fn parse_corpora(
 ///
 /// This is the only place where the full pipeline is assembled —
 /// downstream code just calls `session.execute(cmd).await`.
-async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Result<Session> {
+async fn bootstrap(
+    config: RagrigConfig,
+    log_level: Arc<RwLock<String>>,
+    grobid_rename: Option<GrobidRenameConfig>,
+) -> Result<Session> {
     // Build generation params from config.
     let chat_params = config.chat.params.clone();
     debug!(
@@ -734,6 +756,9 @@ async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Resu
         );
     }
     for entry in corpora.iter().filter(|e| e.active) {
+        if let CorpusKind::Dir(folder) = &entry.kind {
+            grobid::rename_pdfs(grobid_rename.as_ref(), folder.folder()).await?;
+        }
         info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
         let token = CancellationToken::new();
         let watcher = EscWatcher::spawn(token.clone());
@@ -801,6 +826,7 @@ async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Resu
         attached_docs: Vec::new(),
         corpora,
         dyn_corpora: true,
+        grobid_rename,
         doc_parsers,
         pdf_parser,
         epub_parser: EpubParserBackend::Epub,
@@ -1986,6 +2012,9 @@ impl Session {
             // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
             for entry in self.corpora.iter().filter(|e| e.active) {
+                if let CorpusKind::Dir(folder) = &entry.kind {
+                    grobid::rename_pdfs(self.grobid_rename.as_ref(), folder.folder()).await?;
+                }
                 info!(
                     "Re-indexing corpus '{}' ({}).",
                     entry.name,
@@ -2688,6 +2717,9 @@ impl Session {
     /// Sync one named corpus into the store with the current pipeline.
     /// Returns the number of documents indexed.
     async fn sync_corpus_entry(&mut self, idx: usize) -> Result<usize> {
+        if let CorpusKind::Dir(folder) = &self.corpora[idx].kind {
+            grobid::rename_pdfs(self.grobid_rename.as_ref(), folder.folder()).await?;
+        }
         let token = CancellationToken::new();
         let watcher = EscWatcher::spawn(token.clone());
         let bar = embed_progress_bar();
@@ -3182,6 +3214,22 @@ async fn main() -> Result<()> {
     // Explicit corpora survive demo mode; the implicit `folder=.` corpus does not.
     let had_explicit_corpora = !cli.corpus_dirs.is_empty() || !cli.corpus_urls.is_empty();
     let profile_name = cli.profile.clone();
+    // The GROBID pre-pass is CLI-only (like `--demo`): it is not part of the
+    // library `RagrigConfig`, so extract it before the config conversion.
+    let grobid_rename = if cli.embed_rename {
+        if !cfg!(feature = "grobid") {
+            anyhow::bail!(
+                "`--embed-rename` needs a build with the `grobid` cargo feature: \
+                 cargo install ragrig-cli --features grobid (or cargo build --features grobid)"
+            );
+        }
+        Some(GrobidRenameConfig {
+            url: cli.grobid_url.clone(),
+            workers: cli.grobid_workers.max(1),
+        })
+    } else {
+        None
+    };
     let mut cli_config: RagrigConfig = cli.into();
     #[cfg(feature = "test-fixtures")]
     let _demo_fixtures = apply_demo_setup(demo, had_explicit_corpora, &mut cli_config)?;
@@ -3261,7 +3309,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let mut session = bootstrap(config, stderr_level).await?;
+    let mut session = bootstrap(config, stderr_level, grobid_rename).await?;
 
     if demo {
         // Memory off: no query rewriting, no transcript accumulation — every
@@ -4139,7 +4187,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut session = match bootstrap(config, log_level).await {
+        let mut session = match bootstrap(config, log_level, None).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("bootstrap failed (Ollama not running?): {}", e);

@@ -20,6 +20,22 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`--embed-rename`** (with the new `grobid` cargo feature) — before a
+  directory corpus is indexed, every new PDF is parsed by a GROBID server,
+  its header metadata is completed against OpenAlex, and the file is renamed
+  to `Author_Year_Title` (first author surname, year, up to ten title words).
+  Since chunk provenance includes the file name, the chat agent can cite
+  documents by their real title.  `--grobid-url` (default
+  `http://localhost:8070`) and `--grobid-workers` (default 4) configure the
+  pre-pass; processed files are fingerprinted in `.ragrig_grobid.json` so the
+  parse/lookup pass only runs for new or changed PDFs.  Build with
+  `cargo install ragrig-cli --features grobid`; without the feature,
+  `--embed-rename` reports how to enable it.
+
 ## [1.1.0]
 
 ### Added

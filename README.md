@@ -80,6 +80,35 @@ Subsequent launches are instant — only changed files are re-indexed.
 Query > What are the key findings about forced-choice paradigms?
 ```
 
+### Metadata-aware file names with GROBID (`--embed-rename`)
+
+Chunk provenance — including the file name — is embedded with the text, so a
+cryptic name like `paper_v2_final.pdf` gives the chat agent nothing to cite.
+With the optional `grobid` feature, ragrig can parse each PDF's header with a
+running [GROBID](https://grobid.readthedocs.io/) server, complete the
+metadata against OpenAlex, and rename the file to `Author_Year_Title` (first
+author surname, year, up to ten title words) before it is indexed.
+
+```bash
+# Start a GROBID server (Docker), then install/build with the feature:
+docker run --rm -p 8070:8070 grobid/grobid:0.9.1-crf
+
+cargo install ragrig-cli --features grobid
+ragrig-cli --folder ~/Documents/papers --embed-rename
+```
+
+- `--grobid-url <URL>` points at the server (default `http://localhost:8070`).
+- `--grobid-workers <N>` bounds concurrent GROBID/OpenAlex requests (default 4).
+- Processed files are fingerprinted in `.ragrig_grobid.json` in the corpus
+  folder, so the parse and lookup pass only runs for new or changed PDFs.
+- Failures degrade gracefully: an unparseable PDF keeps its name and is still
+  indexed, a failed OpenAlex lookup keeps the GROBID metadata, and a failed
+  rename keeps the original path.  Only an unreachable GROBID server aborts
+  startup.
+
+The pre-pass also runs when a directory corpus is switched on (`/corpus <name>
+on`) and before `/embed index`, so runtime additions are renamed as well.
+
 ### Demo mode
 
 Try ragrig against a real book without any of your own documents:
@@ -403,6 +432,10 @@ Options:
       --max-tokens <N>             Max output tokens
       --seed <N>                   Random seed for reproducibility
       --semantic-scholar-api-key <K>  API key [env: SEMANTIC_SCHOLAR_API_KEY]
+      --embed-rename               Parse new PDFs with GROBID, complete via OpenAlex, rename to
+                                   Author_Year_Title (requires --features grobid and a running server)
+      --grobid-url <URL>           GROBID server base URL [default: http://localhost:8070]
+      --grobid-workers <N>         Concurrent GROBID/OpenAlex requests for --embed-rename [default: 4]
 ```
 
 ---
