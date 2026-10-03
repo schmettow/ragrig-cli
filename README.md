@@ -91,8 +91,9 @@ Chunk provenance — including the file name — is embedded with the text, so a
 cryptic name like `paper_v2_final.pdf` gives the chat agent nothing to cite.
 With the optional `grobid` feature, ragrig can parse each PDF's header with a
 running [GROBID](https://grobid.readthedocs.io/) server, complete the
-metadata against OpenAlex, and rename the file to `Author_Year_Title` (first
-author surname, year, up to ten title words) before it is indexed.
+metadata against OpenAlex, and rename the file to
+`Author1, Author2, ... - Year - Full title` (all authors, punctuation stripped
+from the title) before it is indexed.
 
 ```bash
 # Start a GROBID server (Docker), then install/build with the feature:
@@ -438,7 +439,8 @@ Options:
       --seed <N>                   Random seed for reproducibility
       --semantic-scholar-api-key <K>  API key [env: SEMANTIC_SCHOLAR_API_KEY]
       --embed-rename               Parse new PDFs with GROBID, complete via OpenAlex, rename to
-                                   Author_Year_Title (requires --features grobid and a running server)
+                                   Author1, Author2 - Year - Full title (requires --features grobid
+                                   and a running server)
       --grobid-url <URL>           GROBID server base URL [default: http://localhost:8070]
       --grobid-workers <N>         Concurrent GROBID/OpenAlex requests for --embed-rename [default: 4]
 ```

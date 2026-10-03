@@ -27,12 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--embed-rename`** (with the new `grobid` cargo feature) — before a
   directory corpus is indexed, every new PDF is parsed by a GROBID server,
   its header metadata is completed against OpenAlex, and the file is renamed
-  to `Author_Year_Title` (first author surname, year, up to ten title words).
-  Since chunk provenance includes the file name, the chat agent can cite
-  documents by their real title.  `--grobid-url` (default
-  `http://localhost:8070`) and `--grobid-workers` (default 4) configure the
-  pre-pass; processed files are fingerprinted in `.ragrig_grobid.json` so the
-  parse/lookup pass only runs for new or changed PDFs.  Build with
+  to `Author1, Author2, ... - Year - Full title`: all authors, the year, and
+  the complete title with punctuation stripped.  Since chunk provenance
+  includes the file name, the chat agent can cite documents by their real
+  title.  `--grobid-url` (default `http://localhost:8070`) and
+  `--grobid-workers` (default 4) configure the pre-pass; processed files are
+  fingerprinted in `.ragrig_grobid.json` so the parse/lookup pass only runs
+  for new or changed PDFs.  Build with
   `cargo install ragrig-cli --features grobid`; without the feature,
   `--embed-rename` reports how to enable it.
 

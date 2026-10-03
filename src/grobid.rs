@@ -2,10 +2,11 @@
 //!
 //! With `--embed-rename` (and the `grobid` cargo feature), every new PDF in a
 //! directory corpus is parsed by a GROBID server, its header metadata is
-//! completed against OpenAlex, and the file is renamed to `Author_Year_Title`
-//! (title truncated to ten words) before it is indexed.  ragrig embeds chunk
-//! provenance including the file name, so meaningful names give the chat
-//! agent stable, human-readable citations.
+//! completed against OpenAlex, and the file is renamed to
+//! `Author1, Author2 - Year - Full title` (all authors, punctuation stripped
+//! from the title) before it is indexed.  ragrig embeds chunk provenance
+//! including the file name, so meaningful names give the chat agent stable,
+//! human-readable citations.
 //!
 //! The pre-pass is resilient by design:
 //!
@@ -65,7 +66,7 @@ mod imp {
     use std::time::{Duration, UNIX_EPOCH};
 
     use anyhow::{Context, Result, bail};
-    use grobid::bibtex;
+    use grobid::bibtex::{self, FileStemOptions, FileStemStyle};
     use grobid::openalex::Completer;
     use grobid::{Biblio, GrobidClient, PdfInput, ProcessOptions};
     use log::{info, warn};
@@ -88,6 +89,15 @@ mod imp {
     /// Per-request timeout for OpenAlex lookups, so an unreachable API host
     /// cannot stall a worker for the OS TCP timeout.
     const OPENALEX_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// Rename policy: all authors, year and the full title, joined with
+    /// ` - `; punctuation is stripped and Unicode letters are kept.
+    const RENAME_OPTIONS: FileStemOptions = FileStemOptions {
+        style: FileStemStyle::Full,
+        // Only the compact style truncates the title.
+        title_words: 10,
+        ascii_only: false,
+    };
 
     /// A parsed PDF, tracked by its current path while it is renamed.
     struct Processed {
@@ -124,7 +134,7 @@ mod imp {
 
         info!(
             "GROBID pre-pass: {} PDF(s) in {} — parsing headers, completing against \
-             OpenAlex, renaming to Author_Year_Title ({} worker(s)).",
+             OpenAlex, renaming to Author1, Author2 - Year - Full title ({} worker(s)).",
             pdfs.len(),
             folder.display(),
             cfg.workers.max(1)
@@ -239,7 +249,11 @@ mod imp {
         let mut renamed = 0usize;
         for index in order {
             let original = results[index].path.clone();
-            let final_path = match bibtex::suggest_file_name(&original, &results[index].biblio) {
+            let final_path = match bibtex::suggest_file_name_with(
+                &original,
+                &results[index].biblio,
+                &RENAME_OPTIONS,
+            ) {
                 None => {
                     info!(
                         "GROBID: no usable author/year/title for {}; keeping name",
@@ -399,25 +413,39 @@ mod imp {
         }
 
         #[test]
-        fn target_is_author_year_and_ten_title_words() {
+        fn target_lists_all_authors_year_and_full_title() {
             let biblio = biblio(
                 Some("Kahle"),
                 Some("2000-03-01"),
                 Some("The Barc model for continuous variables with extra words beyond ten"),
             );
-            let target = bibtex::suggest_file_name(Path::new("/papers/orig.pdf"), &biblio).unwrap();
+            let target = bibtex::suggest_file_name_with(
+                Path::new("/papers/orig.pdf"),
+                &biblio,
+                &RENAME_OPTIONS,
+            )
+            .unwrap();
             assert_eq!(
                 target.file_name().unwrap(),
-                "Kahle_2000_The_Barc_model_for_continuous_variables_with_extra_words_beyond.pdf"
+                "Kahle - 2000 - The Barc model for continuous variables with extra words beyond ten.pdf"
             );
         }
 
         #[test]
         fn target_omits_missing_parts() {
             let biblio = biblio(None, Some("2019"), Some("A lone title"));
-            let target = bibtex::suggest_file_name(Path::new("x.pdf"), &biblio).unwrap();
-            assert_eq!(target.file_name().unwrap(), "2019_A_lone_title.pdf");
-            assert!(bibtex::suggest_file_name(Path::new("x.pdf"), &Biblio::default()).is_none());
+            let target =
+                bibtex::suggest_file_name_with(Path::new("x.pdf"), &biblio, &RENAME_OPTIONS)
+                    .unwrap();
+            assert_eq!(target.file_name().unwrap(), "2019 - A lone title.pdf");
+            assert!(
+                bibtex::suggest_file_name_with(
+                    Path::new("x.pdf"),
+                    &Biblio::default(),
+                    &RENAME_OPTIONS
+                )
+                .is_none()
+            );
         }
 
         #[test]
@@ -441,7 +469,7 @@ mod imp {
             let mut manifest = Manifest::default();
 
             assert_eq!(rename_all(&mut results, dir.path(), &mut manifest), 1);
-            let renamed = dir.path().join("Smith_2020_Tiny.pdf");
+            let renamed = dir.path().join("Smith - 2020 - Tiny.pdf");
             assert!(renamed.exists());
             assert!(!original.exists());
             assert_eq!(results[0].path, renamed);
@@ -545,8 +573,9 @@ mod imp {
             Some(String::from_utf8_lossy(&buf).into_owned())
         }
 
-        /// The title "Tiny" stays below the OpenAlex search threshold, so the
-        /// pre-pass makes no OpenAlex call in this test.
+        /// The title "Tiny." stays below the OpenAlex search threshold, so
+        /// the pre-pass makes no OpenAlex call in this test.  Its trailing
+        /// period must be stripped by the rename policy.
         const MOCK_TEI: &str = r#"<TEI xmlns="http://www.tei-c.org/ns/1.0">
     <teiHeader>
         <encodingDesc><appInfo>
@@ -558,10 +587,14 @@ mod imp {
             <sourceDesc>
                 <biblStruct>
                     <analytic>
-                        <title level="a" type="main">Tiny</title>
+                        <title level="a" type="main">Tiny.</title>
                         <author><persName>
                             <forename type="first">Jane</forename>
                             <surname>Smith</surname>
+                        </persName></author>
+                        <author><persName>
+                            <forename type="first">Ann</forename>
+                            <surname>Jones</surname>
                         </persName></author>
                     </analytic>
                     <monogr><imprint><date type="published" when="2020"/></imprint></monogr>
@@ -585,7 +618,7 @@ mod imp {
             };
             rename_pdfs(&cfg, dir.path()).await.expect("pre-pass");
 
-            let renamed = dir.path().join("Smith_2020_Tiny.pdf");
+            let renamed = dir.path().join("Smith, Jones - 2020 - Tiny.pdf");
             assert!(renamed.exists(), "expected {renamed:?} to exist");
             assert!(!pdf.exists(), "the original file must be renamed");
 

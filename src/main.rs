@@ -135,8 +135,9 @@ struct Cli {
 
     /// Before indexing a directory corpus, parse every PDF with a GROBID
     /// server, complete its header metadata against OpenAlex, and rename the
-    /// file to `Author_Year_Title` (title truncated to 10 words).  Requires
-    /// a build with the `grobid` cargo feature and a running GROBID server.
+    /// file to `Author1, Author2 - Year - Full title` (punctuation stripped
+    /// from the title).  Requires a build with the `grobid` cargo feature and
+    /// a running GROBID server.
     #[arg(long)]
     pub embed_rename: bool,
     /// GROBID server base URL used by `--embed-rename`.
