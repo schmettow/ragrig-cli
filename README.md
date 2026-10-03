@@ -386,6 +386,8 @@ Options:
       --embedding-provider <P>     Embedding: ollama (default) or fastembed
   -e, --embedding-model <MODEL>    Ollama embedding model [default: nomic-embed-text]
       --memory-model <MODEL>       Memory/rewrite model [default: qwen2.5:1.5b]
+      --memory-strategy <MODE>     Memory strategy: rewrite, transcript, log, summary, off
+                                   [default: rewrite]
       --prompt-chat <FILE>         Custom system prompt for chat agent
       --prompt-rewrite <FILE>      Custom system prompt for rewrite agent
       --pdf-parser <BACKEND>       PDF parser: unpdf (default), sink, extract, internal

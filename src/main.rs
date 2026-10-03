@@ -9,9 +9,9 @@ use ragrig::{
     AgentSession, AttachedDocument, CancellationToken, ChatAgentSpec, ChunkConfig, Corpus,
     DEFAULT_MAX_DOWNLOAD_BYTES, DocumentParser, DocumentParsers, EmbedderSpec, EpubParserBackend,
     FileIndexResult, FolderCorpus, FsSessionStore, GenerationParams, HistoryStrategy,
-    HybridRrfRanker, LlmReranker, LogHistory, MmrDiversityRanker, PaperResult, PipelineFilter,
-    PrependAttach, ProgressEvent, RagAgent, RagrigError, Ranker, ScoredChunk, SessionId,
-    SessionStore, SummaryHistory, UrlCorpus, WeightedFusionRanker, available_chunkers,
+    HybridRrfRanker, LlmReranker, LogHistory, MemoryStrategyKind, MmrDiversityRanker, PaperResult,
+    PipelineFilter, PrependAttach, ProgressEvent, RagAgent, RagrigError, Ranker, ScoredChunk,
+    SessionId, SessionStore, SummaryHistory, UrlCorpus, WeightedFusionRanker, available_chunkers,
     scan_document_files, search_by_document,
 };
 use ragrig::{parsers, store};
@@ -19,10 +19,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Write, stdout};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -101,6 +100,8 @@ struct CliMemoryConfig {
     pub memory_model: String,
     #[arg(long)]
     pub prompt_rewrite: Option<PathBuf>,
+    #[arg(long = "memory-strategy", default_value = "rewrite")]
+    pub memory_strategy: String,
 }
 
 /// CLI arguments — thin `clap` wrapper that converts into the library `RagrigConfig`.
@@ -214,6 +215,13 @@ impl From<CliMemoryConfig> for MemoryConfig {
         MemoryConfig {
             model: c.memory_model,
             rewrite_prompt_path: c.prompt_rewrite,
+            strategy: match c.memory_strategy.as_str() {
+                "transcript" => MemoryStrategyKind::Transcript,
+                "log" => MemoryStrategyKind::Log,
+                "summary" => MemoryStrategyKind::Summary,
+                "off" => MemoryStrategyKind::Off,
+                _ => MemoryStrategyKind::Rewrite,
+            },
         }
     }
 }
@@ -360,7 +368,7 @@ enum WebRoute {
 ///
 /// ```ignore
 /// let config = RagrigConfig::from(Cli::parse());
-/// let session = bootstrap(config, log_level, None).await?;
+/// let session = bootstrap(config, log_level).await?;
 /// // session enters the REPL loop
 /// ```
 struct Session {
@@ -600,11 +608,7 @@ fn parse_corpora(
 ///
 /// This is the only place where the full pipeline is assembled —
 /// downstream code just calls `session.execute(cmd).await`.
-async fn bootstrap(
-    config: RagrigConfig,
-    log_level: Arc<RwLock<String>>,
-    memory_strategy: Option<String>,
-) -> Result<Session> {
+async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Result<Session> {
     // Build generation params from config.
     let chat_params = config.chat.params.clone();
     debug!(
@@ -673,14 +677,22 @@ async fn bootstrap(
     let store = store::open_store(&config.workspace).await?;
     let chunk_cfg = ChunkConfig::new(config.parse.chunk_size, config.parse.chunk_overlap)?;
 
-    // Build the rewrite (memory) agent.
-    let memory_spec = ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone(), None);
-    let memory_agent = memory_spec.build()?;
-    info!(
-        "Memory: {} ({})",
-        memory_agent.backend_name(),
-        memory_agent.model_name()
-    );
+    // Build the rewrite (memory) agent — only for strategies that use a
+    // rewriter; `off`/`transcript` sessions skip the model entirely.
+    let memory_agent = match config.memory.strategy {
+        MemoryStrategyKind::Off | MemoryStrategyKind::Transcript => None,
+        _ => {
+            let memory_spec =
+                ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone(), None);
+            let agent = memory_spec.build()?;
+            info!(
+                "Memory: {} ({})",
+                agent.backend_name(),
+                agent.model_name()
+            );
+            Some(agent)
+        }
+    };
 
     // Build the RagAgent.
     let mut agent_builder = RagAgent::builder()
@@ -695,11 +707,13 @@ async fn bootstrap(
             config.parse.sloppy_pdf,
         )))
         .chunk_config(chunk_cfg.clone())
-        .rewriter(memory_agent)
         .attach_strategy(Box::new(PrependAttach))
         .context_tokens(config.chat.context_tokens)
         .top_k(config.embed.top_k)
         .similarity_threshold(config.embed.similarity_threshold);
+    if let Some(memory_agent) = memory_agent {
+        agent_builder = agent_builder.rewriter(memory_agent);
+    }
 
     // Optional prompt overrides from CLI.
     if let Some(ref path) = config.chat.system_prompt_path {
@@ -772,10 +786,13 @@ async fn bootstrap(
     let session_store: Box<dyn SessionStore> = Box::new(FsSessionStore::new(sessions_dir)?);
     let mut session = AgentSession::new(agent, session_store);
     info!("Session: {}", session.session_id().0);
-    // A profile loaded at startup may also manage the memory strategy.
-    if let Some(strategy) = memory_strategy {
-        apply_memory_strategy_to(&mut session, &strategy, &config.memory.model);
-    }
+    // Apply the configured memory strategy (from the profile / CLI flags).
+    apply_memory_strategy(
+        &mut session,
+        &config.memory.strategy,
+        &config.memory.model,
+        &config.chat.params,
+    );
 
     Ok(Session {
         config,
@@ -888,58 +905,28 @@ impl From<&str> for Command {
     }
 }
 
-// ── Profile serialisation wrapper ────────────────────────────────────────
+// ── Memory strategy application ───────────────────────────────────────────
 
-/// Backward-compatible wrapper around [`RagrigConfig`] that also carries the
-/// runtime memory strategy (history diffusion), which the library config has
-/// no field for.
+/// Apply a declarative [`MemoryStrategyKind`] to a running session.
 ///
-/// `#[serde(flatten)]` keeps the JSON body identical to a raw `RagrigConfig`,
-/// so existing profiles load unchanged and hand-edited files keep working.
-/// `memory_strategy` is a double-Option: `None` means the key is absent from
-/// the JSON, `Some(None)` means it was written as `null` (memory off / not
-/// managed by the profile).
-#[derive(Serialize, Deserialize, Default)]
-struct ProfileWrapper {
-    #[serde(flatten)]
-    config: RagrigConfig,
-    /// Memory strategy override: `"log"` | `"summary"` | `"off"` |
-    /// `"transcript"`.  Absent/null = the profile does not manage it.
-    memory_strategy: Option<Option<String>>,
-}
-
-/// Read a profile file as a config plus the optional memory-strategy
-/// override.  The wrapper format is tried first; profiles written by older
-/// versions (plain `RagrigConfig`) still load.
-fn load_profile(workspace: &Path, name: &str) -> Result<(RagrigConfig, Option<String>)> {
-    let path = RagrigConfig::profiles_dir(workspace).join(format!("{name}.json"));
-    let json = std::fs::read_to_string(&path)
-        .with_context(|| format!("Profile '{}' not found at {}", name, path.display()))?;
-    match serde_json::from_str::<ProfileWrapper>(&json) {
-        Ok(wrapper) => {
-            let strategy = match wrapper.memory_strategy {
-                Some(Some(s)) => Some(s),
-                _ => None,
-            };
-            Ok((wrapper.config, strategy))
-        }
-        Err(_) => {
-            let config: RagrigConfig = serde_json::from_str(&json)
-                .with_context(|| format!("Profile '{}' is corrupt JSON", name))?;
-            Ok((config, None))
-        }
-    }
-}
-
-/// Apply a memory strategy read from a profile.  Mirrors `/memory`.
-fn apply_memory_strategy_to(session: &mut AgentSession, strategy: &str, memory_model: &str) {
+/// Mirrors the `/memory` command, but with declarative semantics: each
+/// strategy value produces one well-defined state (the `Log` and `Summary`
+/// arms leave the query rewriter untouched, exactly like `/memory log` and
+/// `/memory summary`).  Used by profile loads, `/profile load`, and the
+/// startup path.
+fn apply_memory_strategy(
+    session: &mut AgentSession,
+    strategy: &MemoryStrategyKind,
+    memory_model: &str,
+    chat_params: &GenerationParams,
+) {
     match strategy {
-        "log" => {
+        MemoryStrategyKind::Log => {
             session.set_use_transcript(true);
             session.set_history_strategy(Some(Box::new(LogHistory)));
             info!("History diffusion applied: log");
         }
-        "summary" => {
+        MemoryStrategyKind::Summary => {
             session.set_use_transcript(true);
             let summary_spec = ChatAgentSpec::ollama(
                 memory_model.to_string(),
@@ -955,23 +942,34 @@ fn apply_memory_strategy_to(session: &mut AgentSession, strategy: &str, memory_m
                 Err(e) => RagrigError::log_or(&e, "Failed to build summary agent"),
             }
         }
-        "off" | "none" => {
+        MemoryStrategyKind::Rewrite => {
+            let spec = ChatAgentSpec::ollama(
+                memory_model.to_string(),
+                chat_params.clone(),
+                None,
+            );
+            match spec.build() {
+                Ok(agent) => session.agent_mut().set_rewriter(Some(agent)),
+                Err(e) => RagrigError::log_or(&e, "Failed to rebuild memory agent"),
+            }
+            session.set_use_transcript(true);
+            session.set_history_strategy(None);
+            info!("Memory strategy applied: rewrite");
+        }
+        MemoryStrategyKind::Transcript => {
             session.agent_mut().set_rewriter(None);
+            session.set_history_strategy(None);
+            session.set_use_transcript(true);
+            info!("Memory strategy applied: transcript");
+        }
+        MemoryStrategyKind::Off => {
+            session.agent_mut().set_rewriter(None);
+            session.set_history_strategy(None);
             session.set_use_transcript(false);
             session.clear_turns();
             info!("Memory strategy applied: off");
         }
-        "transcript" => {
-            session.agent_mut().set_rewriter(None);
-            session.set_use_transcript(true);
-            info!("Memory strategy applied: transcript");
-        }
-        other => {
-            warn!(
-                "Unknown memory strategy '{}' in profile; leaving memory untouched",
-                other
-            );
-        }
+        _ => {}
     }
 }
 
@@ -2784,24 +2782,7 @@ impl Session {
                 // Update the in-memory config from the running agent state
                 // before saving, so the profile reflects current runtime settings.
                 self.sync_config_from_agent();
-                let wrapper = ProfileWrapper {
-                    config: self.config.clone(),
-                    memory_strategy: Some(self.current_memory_strategy()),
-                };
-                // Profiles are portable: `workspace` is a caller-supplied
-                // path and must not leak into the file.  (The library's
-                // save_to_profile documents this but still serializes the
-                // field — we honor the documented intent here.)
-                let mut value = serde_json::to_value(&wrapper)?;
-                if let serde_json::Value::Object(ref mut map) = value {
-                    map.remove("workspace");
-                }
-                let dir = RagrigConfig::profiles_dir(&self.config.workspace);
-                std::fs::create_dir_all(&dir)?;
-                let path = dir.join(format!("{name}.json"));
-                let json = serde_json::to_string_pretty(&value)?;
-                std::fs::write(&path, json)?;
-                info!("Profile '{}' saved to {}", name, path.display());
+                self.config.save_to_profile(&self.config.workspace, name)?;
                 println!("Profile '{}' saved.", name);
             }
             "show" => {
@@ -2822,21 +2803,20 @@ impl Session {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             }
             "load" => {
-                // Keep the current workspace — profiles don't override it.
-                let workspace = self.config.workspace.clone();
-                let (config, memory_strategy) = load_profile(&workspace, name)?;
-                self.config = config;
-                self.config.workspace = workspace;
-                // Apply the loaded parameters to the running agents.
+                // The library forces the caller's workspace on load, so the
+                // current one survives even profiles saved on other machines.
+                self.config = RagrigConfig::load_from_profile(&self.config.workspace, name)?;
+                // Apply the loaded parameters to the running agents
+                // (including the memory strategy).
                 self.apply_config().await?;
-                // Apply the memory strategy, when the profile manages it.
-                if let Some(strategy) = memory_strategy {
-                    apply_memory_strategy_to(&mut self.session, &strategy, &self.config.memory.model);
-                }
                 println!("Profile '{}' loaded and applied.", name);
                 info!(
-                    "Loaded profile '{}': chat={} embed={} memory={}",
-                    name, self.config.chat.model, self.config.embed.model, self.config.memory.model,
+                    "Loaded profile '{}': chat={} embed={} memory={} strategy={:?}",
+                    name,
+                    self.config.chat.model,
+                    self.config.embed.model,
+                    self.config.memory.model,
+                    self.config.memory.strategy,
                 );
             }
             _ => {
@@ -2920,16 +2900,14 @@ impl Session {
             .agent_mut()
             .set_similarity_threshold(self.config.embed.similarity_threshold);
 
-        // Memory model — only rebuild when a rewriter is active; whether
-        // memory is on/off is runtime state, not part of the profile.
-        if self.session.agent().rewriter().is_some() {
-            let memory_spec =
-                ChatAgentSpec::ollama(self.config.memory.model.clone(), params.clone(), None);
-            match memory_spec.build() {
-                Ok(agent) => self.session.agent_mut().set_rewriter(Some(agent)),
-                Err(e) => RagrigError::log_or(&e, "Failed to rebuild memory agent"),
-            }
-        }
+        // Memory strategy from the profile: rewriter, transcript flag, and
+        // history diffusion.
+        apply_memory_strategy(
+            &mut self.session,
+            &self.config.memory.strategy,
+            &self.config.memory.model,
+            &params,
+        );
         Ok(())
     }
 
@@ -2950,19 +2928,9 @@ impl Session {
             "Fastembed" => EmbeddingProvider::Fastembed,
             _ => EmbeddingProvider::Ollama,
         };
+        self.config.memory.strategy = self.session.memory_strategy();
         if let Some(rw) = self.session.agent().rewriter() {
             self.config.memory.model = rw.model_name().to_string();
-        }
-    }
-
-    /// The runtime history-diffusion strategy, mapped to its profile name.
-    /// Returns `None` when memory is off, transcript-only, or rewrite mode
-    /// (those are runtime states the profile does not currently persist).
-    fn current_memory_strategy(&self) -> Option<String> {
-        match self.session.history_strategy().map(|s| s.name()) {
-            Some("log") => Some("log".to_string()),
-            Some("summary") => Some("summary".to_string()),
-            _ => None,
         }
     }
 
@@ -3221,21 +3189,21 @@ async fn main() -> Result<()> {
     let _demo_fixtures = apply_demo_setup(demo, had_explicit_corpora, &mut cli_config)?;
 
     // If --profile was given, load it and merge CLI overrides on top.
-    let (config, profile_memory_strategy) = if let Some(ref name) = profile_name {
-        match load_profile(&cli_config.workspace, name) {
-            Ok((mut profile, memory_strategy)) => {
+    let config = if let Some(ref name) = profile_name {
+        match RagrigConfig::load_from_profile(&cli_config.workspace, name) {
+            Ok(mut profile) => {
                 profile.override_with(&cli_config);
                 info!("Loaded profile '{}' with CLI overrides applied.", name);
-                (profile, memory_strategy)
+                profile
             }
             Err(e) => {
                 // Profile not found or corrupt — warn and use CLI values only.
                 warn!("Profile '{}' could not be loaded: {}", name, e);
-                (cli_config, None)
+                cli_config
             }
         }
     } else {
-        (cli_config, None)
+        cli_config
     };
 
     // ── File logging (always debug level, daily rotation) ───────────
@@ -3295,7 +3263,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let mut session = bootstrap(config, stderr_level, profile_memory_strategy).await?;
+    let mut session = bootstrap(config, stderr_level).await?;
 
     if demo {
         // Memory off: no query rewriting, no transcript accumulation — every
@@ -3971,93 +3939,103 @@ mod tests {
     // ── Profile round-trip ───────────────────────────────────────────
 
     #[test]
-    fn profile_wrapper_roundtrip() {
+    fn profile_roundtrip_preserves_memory_strategy() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
-        let wrapper = ProfileWrapper {
-            config: RagrigConfig {
-                workspace: PathBuf::from("/some/foreign/machine/path"),
-                chat: ChatConfig {
-                    provider: Provider::Deepseek,
-                    deepseek_model: "deepseek-v4-pro".into(),
-                    ..Default::default()
-                },
+        let config = RagrigConfig {
+            workspace: PathBuf::from("/some/foreign/machine/path"),
+            chat: ChatConfig {
+                provider: Provider::Deepseek,
+                deepseek_model: "deepseek-v4-pro".into(),
                 ..Default::default()
             },
-            memory_strategy: Some(Some("log".to_string())),
-        };
-        // Mirrors the save path: strip the machine-specific workspace.
-        let mut value = serde_json::to_value(&wrapper).unwrap();
-        if let serde_json::Value::Object(ref mut map) = value {
-            map.remove("workspace");
-        }
-        let dir = RagrigConfig::profiles_dir(&workspace);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("test.json"),
-            serde_json::to_string_pretty(&value).unwrap(),
-        )
-        .unwrap();
-
-        let (loaded, strategy) = load_profile(&workspace, "test").unwrap();
-        assert_eq!(loaded.chat.provider, Provider::Deepseek);
-        assert_eq!(loaded.chat.deepseek_model, "deepseek-v4-pro");
-        // The workspace was not written — deserialization falls back to `.`
-        // and the caller re-supplies its own.
-        assert_eq!(loaded.workspace, PathBuf::from("."));
-        assert_eq!(strategy.as_deref(), Some("log"));
-    }
-
-    #[test]
-    fn profile_legacy_plain_config_loads_without_strategy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        // A profile written by an older version: plain RagrigConfig JSON.
-        let config = RagrigConfig {
-            workspace: PathBuf::from("/tmp/old-machine"),
-            embed: EmbedConfig {
-                top_k: 7,
+            memory: MemoryConfig {
+                model: "qwen2.5:1.5b".into(),
+                strategy: MemoryStrategyKind::Log,
                 ..Default::default()
             },
             ..Default::default()
         };
-        let dir = RagrigConfig::profiles_dir(&workspace);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("legacy.json"),
-            serde_json::to_string_pretty(&config).unwrap(),
-        )
-        .unwrap();
+        config.save_to_profile(&workspace, "test").unwrap();
 
-        let (loaded, strategy) = load_profile(&workspace, "legacy").unwrap();
-        assert_eq!(loaded.embed.top_k, 7);
-        // Legacy files still carry a workspace; callers re-supply their own.
-        assert_eq!(loaded.workspace, PathBuf::from("/tmp/old-machine"));
-        assert!(strategy.is_none());
+        let loaded = RagrigConfig::load_from_profile(&workspace, "test").unwrap();
+        assert_eq!(loaded.chat.provider, Provider::Deepseek);
+        assert_eq!(loaded.chat.deepseek_model, "deepseek-v4-pro");
+        assert_eq!(loaded.memory.strategy, MemoryStrategyKind::Log);
+        // The workspace is caller-supplied: the foreign path never leaks.
+        assert_eq!(loaded.workspace, workspace);
     }
 
     #[test]
     fn profile_saved_json_has_no_workspace_key() {
-        // The save path strips the workspace so profiles are portable across
-        // machines (the library's save_to_profile documents this but keeps
-        // the field — the CLI honors the documented intent).
-        let wrapper = ProfileWrapper {
-            config: RagrigConfig {
-                workspace: PathBuf::from("/home/me/proj"),
+        // The library's save_to_profile omits the machine-specific workspace
+        // so profiles are portable across machines.
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let config = RagrigConfig {
+            workspace: PathBuf::from("/home/me/proj"),
+            memory: MemoryConfig {
+                strategy: MemoryStrategyKind::Off,
                 ..Default::default()
             },
-            memory_strategy: Some(None),
+            ..Default::default()
         };
-        let mut value = serde_json::to_value(&wrapper).unwrap();
-        if let serde_json::Value::Object(ref mut map) = value {
-            map.remove("workspace");
-        }
-        let json = serde_json::to_string_pretty(&value).unwrap();
+        config.save_to_profile(&workspace, "portable").unwrap();
+
+        let path = RagrigConfig::profiles_dir(&workspace).join("portable.json");
+        let json = std::fs::read_to_string(&path).unwrap();
         assert!(!json.contains("workspace"));
-        assert!(json.contains("memory_strategy"));
-        // Still parses back into a full config.
-        let loaded: ProfileWrapper = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.config.workspace, PathBuf::from("."));
+        assert!(json.contains("\"strategy\": \"off\""));
+    }
+
+    /// Profiles written by older versions (with a foreign workspace and no
+    /// memory strategy) still load: the workspace is replaced and the
+    /// strategy falls back to `rewrite`.
+    #[test]
+    fn profile_legacy_plain_config_loads_with_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let legacy = serde_json::json!({
+            "workspace": "/tmp/old-machine",
+            "embed": { "top_k": 7 }
+        });
+        let dir = RagrigConfig::profiles_dir(&workspace);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("legacy.json"), legacy.to_string()).unwrap();
+
+        let loaded = RagrigConfig::load_from_profile(&workspace, "legacy").unwrap();
+        assert_eq!(loaded.embed.top_k, 7);
+        assert_eq!(loaded.workspace, workspace);
+        assert_eq!(loaded.memory.strategy, MemoryStrategyKind::Rewrite);
+    }
+
+    /// The `--memory-strategy` flag maps to the declarative strategy kind;
+    /// the default (`rewrite`) leaves a profile's value untouched on merge.
+    #[test]
+    fn cli_memory_strategy_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "ragrig",
+            "--memory-strategy",
+            "summary",
+            "--workspace",
+            "/tmp/ws",
+        ])
+        .unwrap();
+        let config = RagrigConfig::from(cli);
+        assert_eq!(config.memory.strategy, MemoryStrategyKind::Summary);
+
+        // Default flag value is `rewrite` — a profile's strategy survives
+        // the override merge because defaults are not applied.
+        let defaults = RagrigConfig::from(Cli::try_parse_from(["ragrig"]).unwrap());
+        let mut profile = RagrigConfig {
+            memory: MemoryConfig {
+                strategy: MemoryStrategyKind::Log,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.override_with(&defaults);
+        assert_eq!(profile.memory.strategy, MemoryStrategyKind::Log);
     }
 
     // ── Integration test ─────────────────────────────────────────────
@@ -4086,7 +4064,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut session = match bootstrap(config, log_level, None).await {
+        let mut session = match bootstrap(config, log_level).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("bootstrap failed (Ollama not running?): {}", e);
