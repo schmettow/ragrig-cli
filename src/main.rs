@@ -2322,8 +2322,14 @@ impl Session {
         let arg = args_str.trim();
         if arg.is_empty() {
             // ── Current config ──────────────────────────────────────
+            // Report the state accurately: transcript mode has no
+            // rewriter but keeps the conversation — it must not read
+            // as "off".  History diffusion is shown separately, since
+            // it can coexist with rewriting.
             let mem = if self.session.agent().rewriter().is_some() {
                 "rewrite"
+            } else if self.session.use_transcript() {
+                "transcript"
             } else {
                 "off"
             };
@@ -3583,7 +3589,7 @@ fn parse_number_range(input: &str) -> Result<Vec<usize>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ragrig::{Cancel, TurnRole};
+    use ragrig::{Cancel, MutexGenerator, NoopEmbedder, SimpleGenerator, TurnRole};
 
     // ── Command::from ─────────────────────────────────────────────────
 
@@ -4036,6 +4042,83 @@ mod tests {
         };
         profile.override_with(&defaults);
         assert_eq!(profile.memory.strategy, MemoryStrategyKind::Log);
+    }
+
+    // ── Memory strategy application ────────────────────────────────
+
+    /// A generator that echoes its prompt (the reply reveals whether the
+    /// transcript was passed).
+    #[derive(Debug, Clone)]
+    struct EchoGen;
+    impl SimpleGenerator for EchoGen {
+        fn respond(&mut self, prompt: &str) -> String {
+            format!("echo:{prompt}")
+        }
+        fn backend_name(&self) -> &'static str {
+            "echo"
+        }
+        fn model_name(&self) -> String {
+            "v1".into()
+        }
+    }
+
+    #[cfg(feature = "internal")]
+    fn echo_session() -> (AgentSession, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = RagAgent::builder()
+            .chat(Box::new(MutexGenerator::new(EchoGen)))
+            .embed(Box::new(NoopEmbedder))
+            .store(Box::new(
+                ragrig::store::BruteForceStore::open_or_create(dir.path()).unwrap(),
+            ))
+            .build()
+            .unwrap();
+        let session = AgentSession::new(
+            agent,
+            Box::new(FsSessionStore::new(dir.path().join("sessions")).unwrap()),
+        );
+        (session, dir)
+    }
+
+    /// A transcript-strategy profile must leave the transcript on — this is
+    /// the state the user observed as "memory off" after loading a profile.
+    #[cfg(feature = "internal")]
+    #[tokio::test]
+    async fn apply_memory_strategy_transcript_keeps_transcript_on() {
+        let (mut session, _dir) = echo_session();
+
+        apply_memory_strategy(
+            &mut session,
+            &MemoryStrategyKind::Transcript,
+            "unused-model",
+            &GenerationParams::default(),
+        );
+
+        assert_eq!(session.memory_strategy(), MemoryStrategyKind::Transcript);
+        assert!(session.use_transcript());
+        assert!(session.agent().rewriter().is_none());
+        // Behaviourally: turns are still recorded with the transcript on.
+        session.chat("hi").await.unwrap();
+        assert_eq!(session.turns().len(), 2);
+    }
+
+    /// The off strategy disables both rewriting and transcript accumulation.
+    #[cfg(feature = "internal")]
+    #[tokio::test]
+    async fn apply_memory_strategy_off_disables_transcript() {
+        let (mut session, _dir) = echo_session();
+
+        apply_memory_strategy(
+            &mut session,
+            &MemoryStrategyKind::Off,
+            "unused-model",
+            &GenerationParams::default(),
+        );
+
+        assert_eq!(session.memory_strategy(), MemoryStrategyKind::Off);
+        assert!(!session.use_transcript());
+        session.chat("hi").await.unwrap();
+        assert!(session.turns().is_empty());
     }
 
     // ── Integration test ─────────────────────────────────────────────
