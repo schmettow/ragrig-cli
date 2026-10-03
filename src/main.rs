@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, trace, warn};
 use ragrig::types::{
     ChatConfig, ContextSizeMode, EmbedConfig, EmbeddingProvider, MemoryConfig, ParseConfig,
@@ -15,8 +17,6 @@ use ragrig::{
     scan_document_files, search_by_document,
 };
 use ragrig::{parsers, store};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::fs;
@@ -685,11 +685,7 @@ async fn bootstrap(config: RagrigConfig, log_level: Arc<RwLock<String>>) -> Resu
             let memory_spec =
                 ChatAgentSpec::ollama(config.memory.model.clone(), chat_params.clone(), None);
             let agent = memory_spec.build()?;
-            info!(
-                "Memory: {} ({})",
-                agent.backend_name(),
-                agent.model_name()
-            );
+            info!("Memory: {} ({})", agent.backend_name(), agent.model_name());
             Some(agent)
         }
     };
@@ -928,11 +924,8 @@ fn apply_memory_strategy(
         }
         MemoryStrategyKind::Summary => {
             session.set_use_transcript(true);
-            let summary_spec = ChatAgentSpec::ollama(
-                memory_model.to_string(),
-                GenerationParams::default(),
-                None,
-            );
+            let summary_spec =
+                ChatAgentSpec::ollama(memory_model.to_string(), GenerationParams::default(), None);
             match summary_spec.build() {
                 Ok(summary_agent) => {
                     session
@@ -943,11 +936,7 @@ fn apply_memory_strategy(
             }
         }
         MemoryStrategyKind::Rewrite => {
-            let spec = ChatAgentSpec::ollama(
-                memory_model.to_string(),
-                chat_params.clone(),
-                None,
-            );
+            let spec = ChatAgentSpec::ollama(memory_model.to_string(), chat_params.clone(), None);
             match spec.build() {
                 Ok(agent) => session.agent_mut().set_rewriter(Some(agent)),
                 Err(e) => RagrigError::log_or(&e, "Failed to rebuild memory agent"),
@@ -1991,7 +1980,8 @@ impl Session {
             let token = CancellationToken::new();
             let watcher = EscWatcher::spawn(token.clone());
             let bar = embed_progress_bar();
-            let sink = embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
+            let sink =
+                embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
 
             // Full re-ingest of every active corpus, stats aggregated.
             let mut all_stats: Vec<FileIndexResult> = Vec::new();
@@ -2831,7 +2821,9 @@ impl Session {
                 println!(
                     "  show [name]  — display a profile as JSON (or 'current' for running state)"
                 );
-                println!("  load <name>  — load a profile and apply its settings to the running session");
+                println!(
+                    "  load <name>  — load a profile and apply its settings to the running session"
+                );
                 println!("  list         — list saved profiles");
             }
         }
@@ -3369,7 +3361,7 @@ impl RawInputGuard {
     fn enter() -> Option<Self> {
         #[cfg(unix)]
         {
-            use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+            use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
             let fd = rustix::stdio::stdin();
             let original = tcgetattr(fd).ok()?;
             let mut termios = original.clone();
@@ -3391,7 +3383,7 @@ impl Drop for RawInputGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
-            use rustix::termios::{tcsetattr, OptionalActions};
+            use rustix::termios::{OptionalActions, tcsetattr};
             let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &self.original);
         }
         #[cfg(not(unix))]

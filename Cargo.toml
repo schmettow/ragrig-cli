@@ -42,9 +42,7 @@ all = [
 ]
 
 [dependencies]
-# Dev branch — profile management fixes (MemoryConfig.strategy,
-# portable save_to_profile/load_from_profile).
-ragrig = { path = "../ragrig" }
+ragrig = "1.1"
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }

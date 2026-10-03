@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.0]
 
+### Added
+
+- **`--memory-strategy <MODE>`** — set the memory handling mode from the
+  CLI: `rewrite` (default), `transcript`, `log`, `summary`, or `off`.
+  The default value leaves a profile's stored strategy untouched when
+  CLI overrides are merged on top.
+
 ### Changed
 
 - **Cross-platform REPL UI (crossterm + indicatif)** — the hand-rolled
@@ -39,6 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Non-breaking: same commands, output format, and cancellation
   semantics; history and session files are unchanged.
+
+- **Profile management backed by the library** — profiles now persist
+  the full memory state through ragrig's new `MemoryConfig.strategy`
+  field, so the CLI-side `ProfileWrapper` serialisation workaround is
+  gone.  `/profile save|load` and `--profile` use the library's
+  `save_to_profile` / `load_from_profile`, which no longer write the
+  machine-specific workspace into the file (profiles are portable
+  across machines) and force the caller's workspace on load.  The
+  runtime strategy is synced back via the library's
+  `AgentSession::memory_strategy()`.
+
+### Fixed
+
+- **`/memory` misreported transcript mode as off** — the status line
+  derived the state from the rewriter alone, so a transcript-strategy
+  profile (no rewriter, transcript on) displayed `Memory: off` after a
+  `--profile` restart or `/profile load`, although the conversation was
+  passed to the model and turns accumulated correctly.  The status now
+  reports `transcript` via `use_transcript()`.
 
 ## v1.0.2
 
