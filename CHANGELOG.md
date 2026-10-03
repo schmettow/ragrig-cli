@@ -3,15 +3,6 @@
 Planned work for upcoming versions.  Entries describe intended
 non-breaking changes until they ship in a release.
 
-## v1.2.0: Adding basic reference management
-
-**Goal** Improve quality of citations in generated text
-
-Currently, the LLM chat agent sees the embeddinqs as chunks with provenance as an identifier. If this is a cryptic filename, the agent fails to generate proper citations.
-
-Basic reference management means that references are automatically extracted from the corpus and introduced as meta data to the embeddings. 
-
-
 
 # Changelog
 
@@ -20,7 +11,7 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## v1.2.0
 
 ### Added
 
