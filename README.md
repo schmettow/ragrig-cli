@@ -67,6 +67,11 @@ cargo build --release
 ./target/release/ragrig-cli --folder ~/Documents/papers
 ```
 
+The optional `--embed-rename` pre-pass (`--features grobid`) additionally
+expects the [`grobid-rs`](https://github.com/schmettow/grobid-rs) checkout
+next to ragrig-cli when building from git; release builds resolve `grobid`
+from crates.io.
+
 ### Index and query
 
 ```bash

@@ -3802,12 +3802,10 @@ dependencies = [
 
 [[package]]
 name = "grobid"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cbc010246ba9bc58fd009d9bfb60b1687f0c9f4aab426db4cc965992869745b"
+version = "0.4.0"
 dependencies = [
  "biblatex",
- "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "roxmltree",
  "serde",
  "serde_json",

@@ -49,7 +49,8 @@ all = [
 [dependencies]
 ragrig = "1.1"
 # Optional: GROBID header parsing + OpenAlex completion for `--embed-rename`.
-grobid = { version = "0.3", optional = true }
+# The path serves local co-development; publish grobid 0.4 before ragrig-cli.
+grobid = { version = "0.4", path = "../grobid-rs", optional = true }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }

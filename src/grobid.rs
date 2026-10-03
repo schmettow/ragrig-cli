@@ -75,9 +75,6 @@ mod imp {
 
     use super::GrobidRenameConfig;
 
-    /// Title words kept in the new file name.
-    const TITLE_WORDS: usize = 10;
-
     /// Sidecar manifest with per-file fingerprints of everything already
     /// processed, so unchanged PDFs are not parsed again.
     const MANIFEST_NAME: &str = ".ragrig_grobid.json";
@@ -87,6 +84,10 @@ mod imp {
 
     /// Delay between liveness probes.
     const PROBE_DELAY: Duration = Duration::from_secs(1);
+
+    /// Per-request timeout for OpenAlex lookups, so an unreachable API host
+    /// cannot stall a worker for the OS TCP timeout.
+    const OPENALEX_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// A parsed PDF, tracked by its current path while it is renamed.
     struct Processed {
@@ -131,8 +132,18 @@ mod imp {
 
         let client = GrobidClient::new(&cfg.url)
             .with_context(|| format!("invalid GROBID server URL {:?}", cfg.url))?;
-        wait_for_server(&client).await?;
-        let completer = Completer::new();
+        client
+            .wait_until_ready(PROBE_ATTEMPTS, PROBE_DELAY)
+            .await
+            .with_context(|| {
+                format!(
+                    "GROBID server at {} is not ready — start a GROBID server or drop \
+                     --embed-rename",
+                    cfg.url
+                )
+            })?;
+        let completer =
+            Completer::with_timeout(OPENALEX_TIMEOUT).context("building the OpenAlex completer")?;
         let options = ProcessOptions::default();
         let semaphore = Arc::new(Semaphore::new(cfg.workers.max(1)));
 
@@ -219,47 +230,6 @@ mod imp {
         Ok((biblio, completed))
     }
 
-    /// Wait for the GROBID server to come up, with a bounded number of
-    /// probes; GROBID can take a while to preload its models.
-    async fn wait_for_server(client: &GrobidClient) -> Result<()> {
-        for attempt in 1..=PROBE_ATTEMPTS {
-            let remaining = PROBE_ATTEMPTS - attempt;
-            match client.ping().await {
-                Ok(true) => return Ok(()),
-                Ok(false) if remaining > 0 => {
-                    info!(
-                        "GROBID at {} not alive yet; retrying in {}s ({attempt}/{PROBE_ATTEMPTS}).",
-                        client.base_url(),
-                        PROBE_DELAY.as_secs()
-                    );
-                }
-                Ok(false) => {
-                    bail!(
-                        "GROBID at {} is up, but reports it is not alive",
-                        client.base_url()
-                    );
-                }
-                Err(err) if remaining > 0 => {
-                    info!(
-                        "GROBID at {} not responding ({err}); retrying in {}s ({attempt}/{PROBE_ATTEMPTS}).",
-                        client.base_url(),
-                        PROBE_DELAY.as_secs()
-                    );
-                }
-                Err(err) => {
-                    bail!(
-                        "cannot reach GROBID server at {} after {PROBE_ATTEMPTS} attempts: {err}. \
-                         Start a server (e.g. docker run --rm -p 8070:8070 grobid/grobid:0.9.1-crf) \
-                         or drop --embed-rename.",
-                        client.base_url()
-                    );
-                }
-            }
-            tokio::time::sleep(PROBE_DELAY).await;
-        }
-        unreachable!("the loop returns on its final attempt")
-    }
-
     /// Rename parsed PDFs in deterministic path order (collision suffixes are
     /// stable across runs), record fingerprints of the final paths, and
     /// return the number of files actually renamed.
@@ -269,7 +239,7 @@ mod imp {
         let mut renamed = 0usize;
         for index in order {
             let original = results[index].path.clone();
-            let final_path = match rename_target(&original, &results[index].biblio) {
+            let final_path = match bibtex::suggest_file_name(&original, &results[index].biblio) {
                 None => {
                     info!(
                         "GROBID: no usable author/year/title for {}; keeping name",
@@ -279,7 +249,7 @@ mod imp {
                 }
                 Some(target) if target == original => original,
                 Some(target) => {
-                    let target = first_free(target);
+                    let target = bibtex::unique_path(target);
                     match fs::rename(&original, &target) {
                         Ok(()) => {
                             info!(
@@ -301,72 +271,6 @@ mod imp {
             manifest.record(folder, &final_path);
         }
         renamed
-    }
-
-    /// Build the new file name `Author_Year_<first 10 title words>` for a
-    /// parsed PDF, keeping the original file extension.  Parts are filtered
-    /// to ASCII alphanumerics (as [`bibtex::suggest_key`] does for citation
-    /// keys); missing parts are omitted.  Returns `None` when neither author,
-    /// year nor a title word is available.
-    fn rename_target(path: &Path, biblio: &Biblio) -> Option<PathBuf> {
-        let author = biblio
-            .authors
-            .first()
-            .and_then(|author| author.surname.as_deref())
-            .map(sanitize)
-            .unwrap_or_default();
-        let year = bibtex::year(biblio).unwrap_or_default();
-        let title = biblio
-            .title
-            .as_deref()
-            .unwrap_or_default()
-            .split_whitespace()
-            .take(TITLE_WORDS)
-            .map(sanitize)
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>()
-            .join("_");
-        let stem = [author, year, title]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("_");
-        if stem.is_empty() {
-            return None;
-        }
-        let mut target = path.with_file_name(stem);
-        if let Some(extension) = path.extension() {
-            target.set_extension(extension);
-        }
-        Some(target)
-    }
-
-    /// The first free variant of `target`, extended with a `-2`, `-3`, ...
-    /// suffix on collisions.
-    fn first_free(target: PathBuf) -> PathBuf {
-        let mut candidate = target.clone();
-        let mut suffix = 2usize;
-        while candidate.exists() {
-            candidate = with_suffix(&target, suffix);
-            suffix += 1;
-        }
-        candidate
-    }
-
-    /// Insert a `-<suffix>` marker before the file extension.
-    fn with_suffix(path: &Path, suffix: usize) -> PathBuf {
-        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-        match path.extension() {
-            Some(extension) => {
-                path.with_file_name(format!("{stem}-{suffix}.{}", extension.to_string_lossy()))
-            }
-            None => path.with_file_name(format!("{stem}-{suffix}")),
-        }
-    }
-
-    /// Filter `text` down to ASCII alphanumerics.
-    fn sanitize(text: &str) -> String {
-        text.chars().filter(char::is_ascii_alphanumeric).collect()
     }
 
     /// Recursively collect all PDFs under `dir`, in sorted order.
@@ -501,7 +405,7 @@ mod imp {
                 Some("2000-03-01"),
                 Some("The Barc model for continuous variables with extra words beyond ten"),
             );
-            let target = rename_target(Path::new("/papers/orig.pdf"), &biblio).unwrap();
+            let target = bibtex::suggest_file_name(Path::new("/papers/orig.pdf"), &biblio).unwrap();
             assert_eq!(
                 target.file_name().unwrap(),
                 "Kahle_2000_The_Barc_model_for_continuous_variables_with_extra_words_beyond.pdf"
@@ -511,9 +415,9 @@ mod imp {
         #[test]
         fn target_omits_missing_parts() {
             let biblio = biblio(None, Some("2019"), Some("A lone title"));
-            let target = rename_target(Path::new("x.pdf"), &biblio).unwrap();
+            let target = bibtex::suggest_file_name(Path::new("x.pdf"), &biblio).unwrap();
             assert_eq!(target.file_name().unwrap(), "2019_A_lone_title.pdf");
-            assert!(rename_target(Path::new("x.pdf"), &Biblio::default()).is_none());
+            assert!(bibtex::suggest_file_name(Path::new("x.pdf"), &Biblio::default()).is_none());
         }
 
         #[test]
@@ -521,7 +425,7 @@ mod imp {
             let dir = tempfile::tempdir().unwrap();
             let target = dir.path().join("Smith_2020_Title.pdf");
             fs::write(&target, b"").unwrap();
-            let free = first_free(target);
+            let free = bibtex::unique_path(target);
             assert_eq!(free.file_name().unwrap(), "Smith_2020_Title-2.pdf");
         }
 
@@ -562,6 +466,148 @@ mod imp {
             // A different size means the content changed and is rescanned.
             fs::write(&file, b"much longer").unwrap();
             assert!(!manifest.is_unchanged(dir.path(), &file));
+        }
+
+        /// A minimal synchronous HTTP mock of the two GROBID endpoints the
+        /// pre-pass uses, to exercise the whole chain (client, parser,
+        /// OpenAlex skip, rename, manifest) without a real server.
+        async fn spawn_mock_grobid(tei: &'static str) -> std::net::SocketAddr {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock server");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let tei = tei.to_string();
+                    tokio::spawn(async move {
+                        let Some(head) = read_request_head(&mut stream).await else {
+                            return;
+                        };
+                        let request_line = head.lines().next().unwrap_or("");
+                        let (status, body) = if request_line.contains("/api/isalive") {
+                            ("200 OK", "true".to_string())
+                        } else if request_line.contains("/api/processHeaderDocument") {
+                            ("200 OK", tei)
+                        } else {
+                            ("404 Not Found", String::new())
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            addr
+        }
+
+        /// Read a full request (headers and body, by `Content-Length`) and
+        /// return the header block. Keeping the whole body in the read path
+        /// avoids closing the connection while the client is still sending.
+        async fn read_request_head(stream: &mut tokio::net::TcpStream) -> Option<String> {
+            use tokio::io::AsyncReadExt;
+
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).await.ok()?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= header_end + content_length {
+                    return Some(head);
+                }
+            }
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        }
+
+        /// The title "Tiny" stays below the OpenAlex search threshold, so the
+        /// pre-pass makes no OpenAlex call in this test.
+        const MOCK_TEI: &str = r#"<TEI xmlns="http://www.tei-c.org/ns/1.0">
+    <teiHeader>
+        <encodingDesc><appInfo>
+            <application version="0.9.1" when="2026-01-01T00:00+0000"/>
+        </appInfo></encodingDesc>
+        <fileDesc>
+            <titleStmt><title level="a" type="main">Tiny</title></titleStmt>
+            <publicationStmt><publisher/></publicationStmt>
+            <sourceDesc>
+                <biblStruct>
+                    <analytic>
+                        <title level="a" type="main">Tiny</title>
+                        <author><persName>
+                            <forename type="first">Jane</forename>
+                            <surname>Smith</surname>
+                        </persName></author>
+                    </analytic>
+                    <monogr><imprint><date type="published" when="2020"/></imprint></monogr>
+                </biblStruct>
+            </sourceDesc>
+        </fileDesc>
+    </teiHeader>
+    <text/>
+</TEI>"#;
+
+        #[tokio::test]
+        async fn rename_pdfs_end_to_end_against_mock_server() {
+            let dir = tempfile::tempdir().unwrap();
+            let pdf = dir.path().join("scan.pdf");
+            fs::write(&pdf, b"%PDF-1.4 fake").unwrap();
+
+            let addr = spawn_mock_grobid(MOCK_TEI).await;
+            let cfg = GrobidRenameConfig {
+                url: format!("http://{addr}"),
+                workers: 2,
+            };
+            rename_pdfs(&cfg, dir.path()).await.expect("pre-pass");
+
+            let renamed = dir.path().join("Smith_2020_Tiny.pdf");
+            assert!(renamed.exists(), "expected {renamed:?} to exist");
+            assert!(!pdf.exists(), "the original file must be renamed");
+
+            // The fingerprint manifest turns the second run into a no-op; it
+            // returns before contacting the server again.
+            let manifest = Manifest::load(dir.path());
+            assert!(manifest.is_unchanged(dir.path(), &renamed));
+            rename_pdfs(&cfg, dir.path())
+                .await
+                .expect("second pre-pass");
+            let pdf_count = fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+                })
+                .count();
+            assert_eq!(pdf_count, 1);
         }
     }
 }
