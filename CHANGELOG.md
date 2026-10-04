@@ -11,6 +11,35 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- **`/embed update`** — incremental re-index: runs the GROBID pre-pass for
+  new PDFs (when `--embed-rename` is on) and embeds only new and changed
+  documents, reported with the same per-file table as `/embed index`.
+  Documents that disappeared from a corpus are dropped from the store.
+  `/embed index` keeps its full re-embed semantics.
+- **`/chat show`**, **`/embed show`**, **`/memory show`** — print the full
+  settings of the running pipeline: chat backend, model, context window and
+  mode, temperature, top-p, `max_tokens`, seed; embedding backend, model,
+  top-k, similarity threshold, chunker, chunk size/overlap, parser, store
+  size, GROBID pre-pass; memory mode, history diffusion, rewriter, and turn
+  count.  The generation parameters are mirrored from `/chat` hot-swaps and
+  profile loads, and changing one sampling parameter no longer resets the
+  others.
+
+### Changed
+
+- **GROBID rename format** — renamed PDFs are now
+  `<key> - <full authors> - <title> - <year>`, e.g.
+  `Kahle2000 - Brewster Kahle - The Barc model for continuous variables - 2000.pdf`:
+  the citation key comes first (always ASCII), authors keep their full given
+  and family names, the title is complete and stripped of syntax characters,
+  and the year moves to the end.  Colliding names still number the year
+  (`... - 2000 - Title`, `... - 2000-1 - Title`) so authors and title keep
+  their place.  Needs the `grobid` 0.5 dependency.
+
 ## v1.2.0
 
 ### Added

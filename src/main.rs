@@ -135,9 +135,9 @@ struct Cli {
 
     /// Before indexing a directory corpus, parse every PDF with a GROBID
     /// server, complete its header metadata against OpenAlex, and rename the
-    /// file to `Author1, Author2 - Year - Full title` (punctuation stripped
-    /// from the title).  Requires a build with the `grobid` cargo feature and
-    /// a running GROBID server.
+    /// file to `<key> - <full authors> - <title> - <year>` (punctuation
+    /// stripped from every part).  Requires a build with the `grobid` cargo
+    /// feature and a running GROBID server.
     #[arg(long)]
     pub embed_rename: bool,
     /// GROBID server base URL used by `--embed-rename`.
@@ -392,6 +392,11 @@ struct Session {
     /// Stateful chat session: owns the agent, the transcript, persistence,
     /// and cross-session history diffusion.  All chat turns go through it.
     session: AgentSession,
+    /// Effective chat generation parameters (temperature, top-p, max tokens,
+    /// seed).  Generators do not expose their parameters, so this mirror is
+    /// the source of truth for `/chat show`; `/chat` hot-swaps and profile
+    /// loads keep it in sync.
+    chat_params: GenerationParams,
     last_results: Vec<ScoredChunk>,
     last_search_results: Vec<PaperResult>,
     rl: DefaultEditor,
@@ -819,6 +824,7 @@ async fn bootstrap(
     Ok(Session {
         config,
         session,
+        chat_params,
         last_results: Vec::new(),
         last_search_results: Vec::new(),
         rl,
@@ -1318,16 +1324,16 @@ impl Session {
             "/refs [topic]   — extract references from last query results (optionally filtered by topic)"
         );
         println!(
-            "/chat <backend> [model] [api_key] | context <N> — hot-swap chat engine or adjust context window"
+            "/chat <backend> [model] [api_key] | show | context <N> | temperature/top_p/max_tokens/seed — hot-swap chat engine or tune generation"
         );
         println!(
-            "/embed <backend> [model] | purge | index — hot-swap embedding backend; index (re)builds the current pipeline"
+            "/embed <backend> [model] | show | purge | index | update — hot-swap embedding backend; index re-embeds all, update only new/changed documents"
         );
         println!(
             "/chunker [name] — show or hot-swap the chunking strategy (warns when the pipeline is not indexed)"
         );
         println!(
-            "/memory <backend> [model] [key] | transcript | log | summary | off | purge — hot-swap memory + history diffusion"
+            "/memory <backend> [model] [key] | show | transcript | log | summary | off | purge — hot-swap memory + history diffusion"
         );
         println!("/hist [list | load <id> | delete <id>] — manage saved sessions");
         println!("/prompt chat|rewrite <file> | reset — load custom system prompts");
@@ -1845,6 +1851,34 @@ impl Session {
     async fn cmd_chat(&mut self, args_str: &str) -> Result<()> {
         let mut parts = args_str.split_whitespace();
         let backend = parts.next().unwrap_or("");
+        if backend.eq_ignore_ascii_case("show") {
+            let p = &self.chat_params;
+            println!("Chat settings:");
+            println!(
+                "  backend:        {}",
+                self.session.agent().chat_agent().backend_name()
+            );
+            println!(
+                "  model:          {}",
+                self.session.agent().chat_agent().model_name()
+            );
+            println!(
+                "  context_tokens: {}",
+                self.session.agent().context_tokens()
+            );
+            println!(
+                "  context_mode:   {}",
+                match self.context_size_forced {
+                    ContextSizeMode::Forced => "forced",
+                    _ => "auto",
+                }
+            );
+            println!("  temperature:    {}", fmt_param(&p.temperature));
+            println!("  top_p:          {}", fmt_param(&p.top_p));
+            println!("  max_tokens:     {}", fmt_param(&p.max_tokens));
+            println!("  seed:           {}", fmt_param(&p.seed));
+            return Ok(());
+        }
         if backend == "context" {
             match parts.next().and_then(|s| s.parse::<usize>().ok()) {
                 Some(n) if n > 0 => {
@@ -1907,8 +1941,9 @@ impl Session {
                 self.session.agent().context_tokens(),
             );
             println!(
-                "Usage: /chat <backend> [model] [api_key]  |  context <N>  |  temperature <F>  |  top_p <F>  |  max_tokens <N>  |  seed <N>"
+                "Usage: /chat <backend> [model] [api_key]  |  show  |  context <N>  |  temperature <F>  |  top_p <F>  |  max_tokens <N>  |  seed <N>"
             );
+            println!("  show — print the full generation settings (model, context, sampling)");
             println!("  backends: ollama, deepseek");
             return Ok(());
         }
@@ -1916,13 +1951,17 @@ impl Session {
         let model = parts.next();
         let api_key = parts.next();
 
-        let spec = match ChatAgentSpec::parse(backend, model, api_key, None) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Chat agent spec parse error: {}", e);
-                return Ok(());
-            }
-        };
+        // Carry the tuned generation parameters over to the new agent, so a
+        // backend/model swap does not silently drop them (and `/chat show`
+        // keeps matching the running agent).
+        let spec =
+            match ChatAgentSpec::parse(backend, model, api_key, Some(self.chat_params.clone())) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Chat agent spec parse error: {}", e);
+                    return Ok(());
+                }
+            };
 
         match spec.build() {
             Ok(new_agent) => {
@@ -1942,7 +1981,7 @@ impl Session {
         Ok(())
     }
 
-    // ── /embed <backend> [model] ──────────────────────────────────────
+    // ── Chat generation parameters ────────────────────────────────────
     /// Rebuild the current chat agent with a modified `GenerationParams`, keeping
     /// the same backend and model.
     fn rebuild_chat_with_param(&mut self, f: impl FnOnce(&mut GenerationParams)) {
@@ -1950,13 +1989,12 @@ impl Session {
         let backend = current.backend_name();
         let model = current.model_name();
 
-        // We need to reconstruct the spec with updated params.
-        // Since we can't introspect the existing generator's params,
-        // we start fresh and apply the mutation.
-        let mut params = GenerationParams::default();
+        // Start from the stored parameters, so changing one field does not
+        // silently reset the others (generators are not introspectable).
+        let mut params = self.chat_params.clone();
         f(&mut params);
 
-        let spec = match ChatAgentSpec::parse(backend, Some(model), None, Some(params)) {
+        let spec = match ChatAgentSpec::parse(backend, Some(model), None, Some(params.clone())) {
             Ok(spec) => spec,
             Err(e) => {
                 error!("Cannot rebuild unknown backend: {}", e);
@@ -1967,6 +2005,7 @@ impl Session {
         match spec.build() {
             Ok(new_agent) => {
                 self.session.agent_mut().set_chat_agent(new_agent);
+                self.chat_params = params;
                 let agent = self.session.agent().chat_agent();
                 info!(
                     "Chat params updated: {} ({})",
@@ -1992,14 +2031,55 @@ impl Session {
                 self.session.agent().similarity_threshold(),
             );
             println!(
-                "Usage: /embed <backend> [model]  |  purge  |  index  |  topk <N>  |  threshold <F>"
+                "Usage: /embed <backend> [model]  |  show  |  purge  |  index  |  update  |  topk <N>  |  threshold <F>"
+            );
+            println!("  show   — print the full embed and chunking settings");
+            println!(
+                "  index  — (re)build the index for the current parser+chunker+embedder pipeline"
             );
             println!(
-                "  index — (re)build the index for the current parser+chunker+embedder pipeline"
+                "  update — index only new and changed documents (GROBID rename runs first with --embed-rename)"
             );
             println!(
                 "  backends: {}",
                 EmbedderSpec::available_backends().join(", ")
+            );
+            return Ok(());
+        }
+
+        if backend.eq_ignore_ascii_case("show") {
+            let chunk = self.session.agent().chunk_config();
+            println!("Embed settings:");
+            println!(
+                "  backend:              {}",
+                self.session.agent().embedder().backend_name()
+            );
+            println!(
+                "  model:                {}",
+                self.session.agent().embedder().model_name()
+            );
+            println!("  top_k:                {}", self.session.agent().top_k());
+            println!(
+                "  similarity_threshold: {:.3}",
+                self.session.agent().similarity_threshold()
+            );
+            println!(
+                "  chunker:              {}",
+                self.session.agent().chunker().name()
+            );
+            println!("  chunk_size:           {}", chunk.size);
+            println!("  chunk_overlap:        {}", chunk.overlap);
+            println!("  pdf_parser:           {:?}", self.pdf_parser);
+            println!(
+                "  store:                {} chunks",
+                self.session.agent().store().len()
+            );
+            println!(
+                "  grobid_rename:        {}",
+                match &self.grobid_rename {
+                    Some(cfg) => format!("on ({} — {} workers)", cfg.url, cfg.workers),
+                    None => "off".to_string(),
+                }
             );
             return Ok(());
         }
@@ -2021,89 +2101,30 @@ impl Session {
 
         if backend.eq_ignore_ascii_case("index") {
             info!("Re-indexing all active document corpora...");
-
-            let token = CancellationToken::new();
-            let watcher = EscWatcher::spawn(token.clone());
-            let bar = embed_progress_bar();
-            let sink =
-                embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
-
-            // Full re-ingest of every active corpus, stats aggregated.
-            let mut all_stats: Vec<FileIndexResult> = Vec::new();
-            for entry in self.corpora.iter().filter(|e| e.active) {
-                if let CorpusKind::Dir(folder) = &entry.kind {
-                    grobid::rename_pdfs(self.grobid_rename.as_ref(), folder.folder()).await?;
+            match self.embed_active_corpora(true).await? {
+                Some(stats) => {
+                    info!(
+                        "Re-indexing complete. Store size: {} chunks.",
+                        self.session.agent().store().len()
+                    );
+                    print_index_stats(&stats, "processed");
                 }
-                info!(
-                    "Re-indexing corpus '{}' ({}).",
-                    entry.name,
-                    entry.kind.label()
-                );
-                match self
-                    .session
-                    .agent()
-                    .reindex_corpus_with_progress(entry.as_corpus(), Some(&sink), Some(&token))
-                    .await
-                {
-                    Ok(stats) => all_stats.extend(stats),
-                    Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
-                        bar.finish_and_clear();
-                        info!("Indexing cancelled.");
-                        return Ok(());
-                    }
-                    Err(e) => return Err(e),
-                }
+                None => info!("Indexing cancelled."),
             }
-            drop(watcher);
-            bar.finish_and_clear();
-            info!(
-                "Re-indexing complete. Store size: {} chunks.",
-                self.session.agent().store().len()
-            );
-            // Print the aggregated per-file result table.
-            let stats = &all_stats;
-            let ok_count = stats.iter().filter(|s| s.ok).count();
-            let fail_count = stats.len() - ok_count;
-            let total_chunks: usize = stats.iter().map(|s| s.chunks).sum();
-            let total_chars: usize = stats.iter().map(|s| s.chars).sum();
-            let total_kb: u64 = stats.iter().map(|s| s.file_size_kb).sum();
-            println!(
-                "\n{} files processed ({} ok, {} failed), {} chunks, {} chars, {} KB total.\n",
-                stats.len(),
-                ok_count,
-                fail_count,
-                total_chunks,
-                total_chars,
-                total_kb
-            );
-            if !stats.is_empty() {
-                println!(
-                    "{:<44} {:>6} {:>7} {:>8} {:>6}",
-                    "File", "KB", "Chunks", "Chars", "Avg/Ch"
-                );
-                println!("{}", "─".repeat(78));
-                for s in stats {
-                    let name = if s.file_name.0.len() > 42 {
-                        format!("{}…", &s.file_name.0[..41])
-                    } else {
-                        s.file_name.0.clone()
-                    };
-                    if s.ok {
-                        println!(
-                            "{:<44} {:>6} {:>7} {:>8} {:>6.0}",
-                            name,
-                            s.file_size_kb,
-                            s.chunks,
-                            s.chars,
-                            s.avg_chars_per_chunk()
-                        );
-                    } else {
-                        println!(
-                            "{:<44} {:>6} {:>7} {:>8} {:>6}  FAIL",
-                            name, s.file_size_kb, "—", "—", "—"
-                        );
-                    }
+            return Ok(());
+        }
+
+        if backend.eq_ignore_ascii_case("update") {
+            info!("Updating active document corpora (new and changed documents)...");
+            match self.embed_active_corpora(false).await? {
+                Some(stats) => {
+                    info!(
+                        "Update complete. Store size: {} chunks.",
+                        self.session.agent().store().len()
+                    );
+                    print_index_stats(&stats, "updated");
                 }
+                None => info!("Update cancelled."),
             }
             return Ok(());
         }
@@ -2165,6 +2186,55 @@ impl Session {
             Err(e) => RagrigError::log_or(&e, "Failed to build embedder"),
         }
         Ok(())
+    }
+
+    /// Embed all active document corpora into the vector store.
+    ///
+    /// With `full`, every document is re-embedded
+    /// ([`ragrig::RagAgent::reindex_corpus_with_progress`]); otherwise only
+    /// new and changed documents are processed
+    /// ([`ragrig::RagAgent::sync_corpus_with_progress`], which also drops
+    /// documents that disappeared).  Directory corpora get the GROBID
+    /// rename pre-pass first.  Returns `None` when the user cancels via ESC
+    /// — chunks embedded so far stay in the store.
+    async fn embed_active_corpora(&self, full: bool) -> Result<Option<Vec<FileIndexResult>>> {
+        let token = CancellationToken::new();
+        let watcher = EscWatcher::spawn(token.clone());
+        let bar = embed_progress_bar();
+        let sink = embed_progress_sink(bar.clone(), Arc::new(Mutex::new(EmbedProgress::default())));
+
+        // Full re-ingest (or incremental sync) of every active corpus, stats
+        // aggregated for the caller's report table.
+        let mut all_stats: Vec<FileIndexResult> = Vec::new();
+        for entry in self.corpora.iter().filter(|e| e.active) {
+            if let CorpusKind::Dir(folder) = &entry.kind {
+                grobid::rename_pdfs(self.grobid_rename.as_ref(), folder.folder()).await?;
+            }
+            let verb = if full { "Re-indexing" } else { "Updating" };
+            info!("{} corpus '{}' ({}).", verb, entry.name, entry.kind.label());
+            let result = if full {
+                self.session
+                    .agent()
+                    .reindex_corpus_with_progress(entry.as_corpus(), Some(&sink), Some(&token))
+                    .await
+            } else {
+                self.session
+                    .agent()
+                    .sync_corpus_with_progress(entry.as_corpus(), Some(&sink), Some(&token))
+                    .await
+            };
+            match result {
+                Ok(stats) => all_stats.extend(stats),
+                Err(e) if e.downcast_ref::<ragrig::Cancelled>().is_some() => {
+                    bar.finish_and_clear();
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        drop(watcher);
+        bar.finish_and_clear();
+        Ok(Some(all_stats))
     }
 
     // ── /chunker [name] ──────────────────────────────────────────────
@@ -2354,6 +2424,18 @@ impl Session {
         Ok(())
     }
 
+    /// Current memory mode as a display string: `"rewrite"`, `"transcript"`,
+    /// or `"off"`.  Shared by the `/memory` status and `/memory show`.
+    fn memory_mode(&self) -> &'static str {
+        if self.session.agent().rewriter().is_some() {
+            "rewrite"
+        } else if self.session.use_transcript() {
+            "transcript"
+        } else {
+            "off"
+        }
+    }
+
     // ── /memory <backend> [model] [api_key] | off ───────────────────
 
     async fn cmd_memory(&mut self, args_str: &str) -> Result<()> {
@@ -2364,13 +2446,7 @@ impl Session {
             // rewriter but keeps the conversation — it must not read
             // as "off".  History diffusion is shown separately, since
             // it can coexist with rewriting.
-            let mem = if self.session.agent().rewriter().is_some() {
-                "rewrite"
-            } else if self.session.use_transcript() {
-                "transcript"
-            } else {
-                "off"
-            };
+            let mem = self.memory_mode();
             let diff = match self.session.history_strategy() {
                 Some(s) => s.name(),
                 None => "off",
@@ -2383,12 +2459,33 @@ impl Session {
             );
             // ── Usage ──────────────────────────────────────────────
             println!(
-                "Usage: /memory <backend> [model] [api_key]  |  transcript  |  log  |  summary  |  off  |  purge"
+                "Usage: /memory <backend> [model] [api_key]  |  show  |  transcript  |  log  |  summary  |  off  |  purge"
             );
+            println!("  show — print the full memory settings (mode, model, diffusion)");
             println!("  backends: ollama, deepseek");
             println!("  modes:    transcript — raw memory, no query rewriting");
             println!("            log       — enable history diffusion (raw last session)");
             println!("            summary   — enable history diffusion (LLM summarisation)");
+            return Ok(());
+        }
+
+        if arg.eq_ignore_ascii_case("show") {
+            let rewriter = match self.session.agent().rewriter() {
+                Some(rw) => format!("{} ({})", rw.backend_name(), rw.model_name()),
+                None => "—".to_string(),
+            };
+            println!("Memory settings:");
+            println!("  mode:              {}", self.memory_mode());
+            println!(
+                "  history_diffusion: {}",
+                match self.session.history_strategy() {
+                    Some(s) => s.name(),
+                    None => "off",
+                }
+            );
+            println!("  rewriter:          {}", rewriter);
+            println!("  configured model:  {}", self.config.memory.model);
+            println!("  turns:             {}", self.session.turns().len());
             return Ok(());
         }
 
@@ -2957,6 +3054,7 @@ impl Session {
             &self.config.memory.model,
             &params,
         );
+        self.chat_params = params;
         Ok(())
     }
 
@@ -2968,6 +3066,7 @@ impl Session {
         self.config.embed.top_k = self.session.agent().top_k();
         self.config.embed.similarity_threshold = self.session.agent().similarity_threshold();
         self.config.chat.context_tokens = self.session.agent().context_tokens();
+        self.config.chat.params = self.chat_params.clone();
         self.config.chat.provider = match self.session.agent().chat_agent().backend_name() {
             "DeepSeek" => Provider::Deepseek,
             _ => Provider::Ollama,
@@ -3583,6 +3682,73 @@ fn embed_progress_sink(
     }
 }
 
+/// Render an optional generation parameter for `/chat show`: the value, or
+/// a marker when the backend picks its own default.
+fn fmt_param<T: std::fmt::Display>(value: &Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "— (backend default)".to_string(),
+    }
+}
+
+/// Truncate a file name to the 44-column `/embed` report table, splitting on
+/// character boundaries (renamed files may contain Unicode).
+fn truncate_name(name: &str) -> String {
+    if name.chars().count() > 42 {
+        format!("{}…", name.chars().take(41).collect::<String>())
+    } else {
+        name.to_string()
+    }
+}
+
+/// Print the per-file indexing result table and its summary line.
+///
+/// `verb` is the past participle used in the summary ("processed" /
+/// "updated").
+fn print_index_stats(stats: &[FileIndexResult], verb: &str) {
+    let ok_count = stats.iter().filter(|s| s.ok).count();
+    let fail_count = stats.len() - ok_count;
+    let total_chunks: usize = stats.iter().map(|s| s.chunks).sum();
+    let total_chars: usize = stats.iter().map(|s| s.chars).sum();
+    let total_kb: u64 = stats.iter().map(|s| s.file_size_kb).sum();
+    println!(
+        "\n{} files {} ({} ok, {} failed), {} chunks, {} chars, {} KB total.\n",
+        stats.len(),
+        verb,
+        ok_count,
+        fail_count,
+        total_chunks,
+        total_chars,
+        total_kb
+    );
+    if stats.is_empty() {
+        return;
+    }
+    println!(
+        "{:<44} {:>6} {:>7} {:>8} {:>6}",
+        "File", "KB", "Chunks", "Chars", "Avg/Ch"
+    );
+    println!("{}", "─".repeat(78));
+    for s in stats {
+        let name = truncate_name(&s.file_name.0);
+        if s.ok {
+            println!(
+                "{:<44} {:>6} {:>7} {:>8} {:>6.0}",
+                name,
+                s.file_size_kb,
+                s.chunks,
+                s.chars,
+                s.avg_chars_per_chunk()
+            );
+        } else {
+            println!(
+                "{:<44} {:>6} {:>7} {:>8} {:>6}  FAIL",
+                name, s.file_size_kb, "—", "—", "—"
+            );
+        }
+    }
+}
+
 // ── Utility functions ─────────────────────────────────────────────────────
 
 /// Strip ANSI escape sequences (bracketed paste, colors, etc.) from a string.
@@ -4139,6 +4305,100 @@ mod tests {
         (session, dir)
     }
 
+    /// A full CLI [`Session`] around an in-memory echo agent and a
+    /// brute-force store, for exercising command handlers end-to-end.
+    #[cfg(feature = "internal")]
+    fn cli_session(dir: &std::path::Path, corpora: Vec<CorpusEntry>) -> Session {
+        let parsers = || DocumentParsers::new(filtered_parsers(&PdfParserBackend::Extract, false));
+        let agent = RagAgent::builder()
+            .chat(Box::new(MutexGenerator::new(EchoGen)))
+            .embed(Box::new(NoopEmbedder))
+            .store(Box::new(
+                ragrig::store::BruteForceStore::open_or_create(dir).unwrap(),
+            ))
+            .parsers(parsers())
+            .build()
+            .unwrap();
+        let session = AgentSession::new(
+            agent,
+            Box::new(FsSessionStore::new(dir.join("sessions")).unwrap()),
+        );
+        Session {
+            config: RagrigConfig::default(),
+            session,
+            chat_params: GenerationParams::default(),
+            last_results: Vec::new(),
+            last_search_results: Vec::new(),
+            rl: DefaultEditor::new().unwrap(),
+            history_path: dir.join(".ragrig_history"),
+            http_client: reqwest::Client::new(),
+            doc_parsers: parsers(),
+            pdf_parser: PdfParserBackend::Extract,
+            epub_parser: EpubParserBackend::Epub,
+            context_size_forced: ContextSizeMode::Auto,
+            attached_docs: Vec::new(),
+            corpora,
+            grobid_rename: None,
+            dyn_corpora: true,
+            log_level: Arc::new(RwLock::new("warn".into())),
+        }
+    }
+
+    /// `/embed update` indexes new files once and skips them on the next run;
+    /// `/embed index` remains the full re-embed path.
+    #[cfg(feature = "internal")]
+    #[tokio::test]
+    async fn embed_update_only_processes_new_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus_dir = dir.path().join("papers");
+        fs::create_dir(&corpus_dir).unwrap();
+        fs::write(
+            corpus_dir.join("note.md"),
+            "# A short note\n\nSome content that can be chunked and embedded.",
+        )
+        .unwrap();
+
+        let session = cli_session(
+            dir.path(),
+            vec![CorpusEntry {
+                name: "papers".into(),
+                kind: CorpusKind::Dir(FolderCorpus::new(corpus_dir)),
+                active: true,
+            }],
+        );
+
+        // First update: the new file is ingested.
+        let first = session.embed_active_corpora(false).await.unwrap().unwrap();
+        assert_eq!(first.len(), 1, "one new document expected: {first:?}");
+        assert!(first[0].ok);
+        let indexed_chunks = session.session.agent().store().len();
+        assert!(indexed_chunks > 0);
+
+        // Second update: nothing new or changed — no file is processed and
+        // the stored chunks are untouched.
+        let second = session.embed_active_corpora(false).await.unwrap().unwrap();
+        assert!(
+            second.is_empty(),
+            "no-op update must not re-embed anything: {second:?}"
+        );
+        assert_eq!(session.session.agent().store().len(), indexed_chunks);
+    }
+
+    /// The `show` subcommands render the full settings and leave the
+    /// pipeline untouched.
+    #[cfg(feature = "internal")]
+    #[tokio::test]
+    async fn show_subcommands_render_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = cli_session(dir.path(), Vec::new());
+
+        session.cmd_chat("show").await.unwrap();
+        session.cmd_embed("show").await.unwrap();
+        session.cmd_memory("show").await.unwrap();
+
+        assert!(session.session.turns().is_empty());
+    }
+
     /// A transcript-strategy profile must leave the transcript on — this is
     /// the state the user observed as "memory off" after loading a profile.
     #[cfg(feature = "internal")]
@@ -4178,6 +4438,53 @@ mod tests {
         assert!(!session.use_transcript());
         session.chat("hi").await.unwrap();
         assert!(session.turns().is_empty());
+    }
+
+    // ── /chat, /embed, /memory show ───────────────────────────────────
+
+    #[test]
+    fn parse_show_subcommands() {
+        assert!(matches!(Command::from("/chat show"), Command::Chat(s) if s == "show"));
+        assert!(matches!(Command::from("/embed show"), Command::Embed(s) if s == "show"));
+        assert!(matches!(Command::from("/memory show"), Command::Memory(s) if s == "show"));
+    }
+
+    #[test]
+    fn fmt_param_renders_values_and_backend_default() {
+        assert_eq!(fmt_param(&Some(0.7_f64)), "0.7");
+        assert_eq!(fmt_param(&Some(2048_usize)), "2048");
+        assert_eq!(fmt_param(&None::<u64>), "— (backend default)");
+    }
+
+    #[test]
+    fn truncate_name_is_char_safe_and_bounded() {
+        // GROBID renames keep Unicode, so the report table must not slice
+        // on byte boundaries (it used to panic on multibyte names).
+        let name = "Ünïcodé — eine sehr lange Überschrift mit Umlauten und noch mehr Zeichen.pdf";
+        let short = truncate_name(name);
+        assert!(short.ends_with('…'));
+        assert_eq!(short.chars().count(), 42);
+        assert_eq!(truncate_name("kurz.pdf"), "kurz.pdf");
+    }
+
+    #[test]
+    fn print_index_stats_handles_multibyte_names() {
+        use ragrig::DocumentId;
+
+        let stats = vec![ragrig::FileIndexResult {
+            corpus: "papers".to_string(),
+            file_name: DocumentId::from(
+                "Ünïcodé — eine sehr lange Überschrift mit Umlauten und noch mehr Zeichen.pdf",
+            ),
+            parser: "unpdf".to_string(),
+            chunks: 3,
+            chars: 120,
+            file_size_kb: 7,
+            ok: true,
+            error: None,
+        }];
+        // Only asserts the table renders without panicking.
+        print_index_stats(&stats, "processed");
     }
 
     // ── Integration test ─────────────────────────────────────────────

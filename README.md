@@ -94,17 +94,20 @@ running [GROBID](https://grobid.readthedocs.io/) server, completes the
 metadata against OpenAlex, and renames the file to
 
 ```text
-Author1, Author2, ... - Year - Full title
+Key - Full authors - Full title - Year
 ```
 
-before it is indexed. Syntax characters are stripped from every part, so
+before it is indexed, e.g.
+`Kahle2000 - Brewster Kahle - The Barc model for continuous variables - 2000.pdf`.
+Syntax characters are stripped from every part, so
 `The B.A.R.C. model: for continuous variables!` becomes
-`The BARC model for continuous variables`, and diacritics are kept:
-`Milašauskienė, Žemyna - 2003 - Changes of patients satisfaction with the
-health care services.pdf`.
+`The Barc model for continuous variables`, and diacritics are kept (the
+citation key itself stays ASCII):
+`Milaauskien2003 - Žemyna Milašauskienė - Changes of patients satisfaction
+with the health care services - 2003.pdf`.
 When two records would produce the same name, the year is numbered —
-`... - 2020 - Title.pdf`, `... - 2020-1 - Title.pdf`, `... - 2020-2 -
-Title.pdf` — so authors and title keep their place.
+`... - 2000 - Title`, `... - 2000-1 - Title`, `... - 2000-2 - Title` — so
+authors and title keep their place.
 
 #### Prerequisites
 
@@ -150,9 +153,9 @@ ragrig-cli --folder ~/Documents/papers --embed-rename
 
 ```text
 $ ragrig-cli --folder ~/papers --embed-rename
-INFO GROBID pre-pass: 2 PDF(s) in /home/me/papers — parsing headers, completing against OpenAlex, renaming to Author1, Author2 - Year - Full title (4 worker(s)).
-INFO GROBID: renamed /home/me/papers/paper_v2_final.pdf → /home/me/papers/Kahle, Brewster - 2000 - The Barc model for continuous variables.pdf
-INFO GROBID: renamed /home/me/papers/scan_0012.pdf → /home/me/papers/Milašauskienė, Žemyna - 2003 - Changes of patients satisfaction with the health care services.pdf
+INFO GROBID pre-pass: 2 PDF(s) in /home/me/papers — parsing headers, completing against OpenAlex, renaming to Key - Full authors - Full title - Year (4 worker(s)).
+INFO GROBID: renamed /home/me/papers/paper_v2_final.pdf → /home/me/papers/Kahle2000 - Brewster Kahle - The Barc model for continuous variables - 2000.pdf
+INFO GROBID: renamed /home/me/papers/scan_0012.pdf → /home/me/papers/Milaauskien2003 - Žemyna Milašauskienė - Changes of patients satisfaction with the health care services - 2003.pdf
 INFO GROBID pre-pass done: 2 of 2 PDF(s) renamed, 1 OpenAlex-completed, 0 failed.
 ```
 
@@ -160,8 +163,11 @@ INFO GROBID pre-pass done: 2 of 2 PDF(s) renamed, 1 OpenAlex-completed, 0 failed
   e.g. a remote or shared instance; `--grobid-workers <N>` bounds concurrent
   GROBID/OpenAlex requests (default 4).
 - The pre-pass runs at startup, when a directory corpus is switched on
-  (`/corpus <name> on`), before `/embed index`, and after `/download` or
-  `/get` saves a file into a directory corpus or into the main folder.
+  (`/corpus <name> on`), before `/embed index` and `/embed update`, and
+  after `/download` or `/get` saves a file into a directory corpus or into
+  the main folder.  `/embed update` is the incremental path: it renames
+  new PDFs and embeds only new and changed documents, while
+  `/embed index` re-embeds everything.
   Documents added to a URL corpus are fetched directly and have no local
   file, so there is nothing to rename.
 - Processed files are fingerprinted in `.ragrig_grobid.json` in the corpus
@@ -224,7 +230,8 @@ Query > /search threshold 0.08       # stricter semantic filter
 - Press **ESC** while an answer is generating (or while documents are being
   indexed) to cancel the operation; the terminal is restored afterwards.
   Works on Unix and native Windows alike.
-- Indexing (bootstrap, `/embed index`, `/corpus <name> on`) renders a live
+- Indexing (bootstrap, `/embed index`, `/embed update`,
+  `/corpus <name> on`) renders a live
   progress bar with files processed, chunks embedded, and failures:
   `[####----] 7/12 files | 341 chunks | papers/a.pdf (ESC: cancel)`.
 
@@ -366,9 +373,9 @@ under a pipeline that has not been indexed yet is an error.
 | `/scholar <query>` | Search Semantic Scholar |
 | `/arxiv <query>` | Search arXiv (no rate limits) |
 | `/refs [topic]` | Extract references from last RAG results |
-| `/chat <b> [model] [key] \| context <N>` | Hot-swap chat engine, set context window |
-| `/embed <b> [model] \| purge \| index \| topk <N> \| threshold <F>` | Hot-swap embedding, clear store, re-index, tune search |
-| `/memory <b> [model] [key] \| transcript \| log \| summary \| off \| purge` | Hot-swap memory, history diffusion, or clear |
+| `/chat <b> [model] [key] \| show \| context <N> \| temperature <F> \| top_p <F> \| max_tokens <N> \| seed <N>` | Hot-swap chat engine, print or adjust generation settings |
+| `/embed <b> [model] \| show \| purge \| index \| update \| topk <N> \| threshold <F>` | Hot-swap embedding; show settings; clear store; re-index all; update new/changed docs; tune search |
+| `/memory <b> [model] [key] \| show \| transcript \| log \| summary \| off \| purge` | Hot-swap memory, print settings, history diffusion, or clear |
 | `/prompt chat\|rewrite <file> \| reset` | Load custom system prompts |
 | `/parser pdf unpdf\|sink\|extract\|internal\|vision \| epub epub` | Hot-swap document parser per format |
 | `/chunker [name]` | Show or hot-swap the chunking strategy (warns when the pipeline is not indexed) |
@@ -496,7 +503,7 @@ Options:
       --seed <N>                   Random seed for reproducibility
       --semantic-scholar-api-key <K>  API key [env: SEMANTIC_SCHOLAR_API_KEY]
       --embed-rename               Parse new PDFs with GROBID, complete via OpenAlex, rename to
-                                   Author1, Author2 - Year - Full title (requires --features grobid
+                                   Key - Full authors - Full title - Year (requires --features grobid
                                    and a running server)
       --grobid-url <URL>           GROBID server base URL [default: http://localhost:8070]
       --grobid-workers <N>         Concurrent GROBID/OpenAlex requests for --embed-rename [default: 4]

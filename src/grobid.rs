@@ -3,10 +3,10 @@
 //! With `--embed-rename` (and the `grobid` cargo feature), every new PDF in a
 //! directory corpus is parsed by a GROBID server, its header metadata is
 //! completed against OpenAlex, and the file is renamed to
-//! `Author1, Author2 - Year - Full title` (all authors, punctuation stripped
-//! from the title) before it is indexed.  ragrig embeds chunk provenance
-//! including the file name, so meaningful names give the chat agent stable,
-//! human-readable citations.
+//! `Key - Full authors - Full title - Year` (citation key, all authors with
+//! full names, punctuation-stripped title, year) before it is indexed.
+//! ragrig embeds chunk provenance including the file name, so meaningful
+//! names give the chat agent stable, human-readable citations.
 //!
 //! The pre-pass is resilient by design:
 //!
@@ -91,11 +91,12 @@ mod imp {
     /// cannot stall a worker for the OS TCP timeout.
     const OPENALEX_TIMEOUT: Duration = Duration::from_secs(15);
 
-    /// Rename policy: all authors, year and the full title, joined with
-    /// ` - `; punctuation is stripped and Unicode letters are kept.
+    /// Rename policy: `Key - Full authors - Full title - Year`; syntax
+    /// characters are stripped, Unicode letters are kept (the citation key
+    /// itself is always ASCII).
     const RENAME_OPTIONS: FileStemOptions = FileStemOptions {
-        style: FileStemStyle::Full,
-        // Only the compact style truncates the title.
+        style: FileStemStyle::Keyed,
+        // `title_words` only applies to `Compact`; `Keyed` keeps the full title.
         title_words: 10,
         ascii_only: false,
     };
@@ -135,7 +136,7 @@ mod imp {
 
         info!(
             "GROBID pre-pass: {} PDF(s) in {} — parsing headers, completing against \
-             OpenAlex, renaming to Author1, Author2 - Year - Full title ({} worker(s)).",
+             OpenAlex, renaming to Key - Full authors - Full title - Year ({} worker(s)).",
             pdfs.len(),
             folder.display(),
             cfg.workers.max(1)
@@ -420,7 +421,7 @@ mod imp {
         }
 
         #[test]
-        fn target_lists_all_authors_year_and_full_title() {
+        fn target_is_key_full_authors_title_year() {
             let biblio = biblio(
                 Some("Kahle"),
                 Some("2000-03-01"),
@@ -434,7 +435,7 @@ mod imp {
             .unwrap();
             assert_eq!(
                 target.file_name().unwrap(),
-                "Kahle - 2000 - The Barc model for continuous variables with extra words beyond ten.pdf"
+                "Kahle2000 - Kahle - The Barc model for continuous variables with extra words beyond ten - 2000.pdf"
             );
         }
 
@@ -444,7 +445,8 @@ mod imp {
             let target =
                 bibtex::suggest_file_name_with(Path::new("x.pdf"), &biblio, &RENAME_OPTIONS)
                     .unwrap();
-            assert_eq!(target.file_name().unwrap(), "2019 - A lone title.pdf");
+            // Without an author or year there is no key; the title leads.
+            assert_eq!(target.file_name().unwrap(), "A lone title - 2019.pdf");
             assert!(
                 bibtex::suggest_file_name_with(
                     Path::new("x.pdf"),
@@ -494,8 +496,8 @@ mod imp {
             assert_eq!(
                 names,
                 vec![
-                    "Smith - 2020 - Same title.pdf",
-                    "Smith - 2020-1 - Same title.pdf"
+                    "Smith2020 - Smith - Same title - 2020-1.pdf",
+                    "Smith2020 - Smith - Same title - 2020.pdf"
                 ]
             );
         }
@@ -512,7 +514,7 @@ mod imp {
             let mut manifest = Manifest::default();
 
             assert_eq!(rename_all(&mut results, dir.path(), &mut manifest), 1);
-            let renamed = dir.path().join("Smith - 2020 - Tiny.pdf");
+            let renamed = dir.path().join("Smith2020 - Smith - Tiny - 2020.pdf");
             assert!(renamed.exists());
             assert!(!original.exists());
             assert_eq!(results[0].path, renamed);
@@ -664,11 +666,15 @@ mod imp {
             };
             rename_pdfs(&cfg, dir.path()).await.expect("pre-pass");
 
-            let renamed = dir.path().join("Smith, Jones - 2020 - Tiny.pdf");
+            let renamed = dir
+                .path()
+                .join("Smith2020 - Jane Smith, Ann Jones - Tiny - 2020.pdf");
             assert!(renamed.exists(), "expected {renamed:?} to exist");
-            // The collision is resolved by numbering the year, so the title
-            // stays at the end of both names.
-            let numbered = dir.path().join("Smith, Jones - 2020-1 - Tiny.pdf");
+            // The collision is resolved by numbering the year at the end of
+            // the name.
+            let numbered = dir
+                .path()
+                .join("Smith2020 - Jane Smith, Ann Jones - Tiny - 2020-1.pdf");
             assert!(numbered.exists(), "expected {numbered:?} to exist");
             assert!(!pdf.exists(), "the first original file must be renamed");
             assert!(

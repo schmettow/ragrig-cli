@@ -30,8 +30,9 @@ vision-pdf = ["ragrig/vision-pdf"]
 chunker-textsplitter = ["ragrig/chunker-textsplitter"]
 chunker-cognigraph = ["ragrig/chunker-cognigraph"]
 # GROBID pre-pass (`--embed-rename`): parse PDF headers with a GROBID server,
-# complete them against OpenAlex, and rename each file to Author_Year_Title
-# before indexing.  Off by default: the pre-pass needs a running GROBID server.
+# complete them against OpenAlex, and rename each file to
+# <key> - <full authors> - <title> - <year> before indexing.  Off by default:
+# the pre-pass needs a running GROBID server.
 grobid = ["dep:grobid", "grobid/openalex"]
 # `all` must enable the CLI-local features too: `internal-embed`,
 # `kreuzberg`, and `vision-pdf` gate match arms in main.rs, and
@@ -49,8 +50,8 @@ all = [
 [dependencies]
 ragrig = "1.1"
 # Optional: GROBID header parsing + OpenAlex completion for `--embed-rename`.
-# The path serves local co-development; publish grobid 0.4 before ragrig-cli.
-grobid = { version = "0.4", optional = true }
+# The path serves local co-development; publish grobid 0.5 before ragrig-cli.
+grobid = { version = "0.5", path = "../grobid-rs", optional = true }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
