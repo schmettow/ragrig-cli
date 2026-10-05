@@ -33,7 +33,7 @@ chunker-cognigraph = ["ragrig/chunker-cognigraph"]
 # complete them against OpenAlex, and rename each file to
 # <key> - <full authors> - <title> - <year> before indexing.  Off by default:
 # the pre-pass needs a running GROBID server.
-grobid = ["dep:grobid", "grobid/openalex"]
+grobid = ["dep:grobid-bibtex", "grobid-bibtex/openalex"]
 # `all` must enable the CLI-local features too: `internal-embed`,
 # `kreuzberg`, and `vision-pdf` gate match arms in main.rs, and
 # `ragrig/all` alone does not set the CLI's own feature flags.
@@ -49,9 +49,11 @@ all = [
 
 [dependencies]
 ragrig = "1.1"
-# Optional: GROBID header parsing + OpenAlex completion for `--embed-rename`.
-# The path serves local co-development; publish grobid 0.5 before ragrig-cli.
-grobid = { version = "0.5", path = "../grobid-rs", optional = true }
+# Optional: GROBID header parsing + OpenAlex completion for `--embed-rename`,
+# with the extraction, completion, renaming and fingerprint-manifest helpers
+# of grobid-bibtex.  The path serves local co-development; publish
+# grobid-bibtex 0.1 before ragrig-cli.
+grobid-bibtex = { version = "0.1", path = "../grobid-bibtex", optional = true }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }

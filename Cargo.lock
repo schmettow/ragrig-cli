@@ -3821,9 +3821,8 @@ dependencies = [
 
 [[package]]
 name = "grobid"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
- "biblatex",
  "reqwest 0.13.5",
  "roxmltree",
  "serde",
@@ -3831,6 +3830,19 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "grobid-bibtex"
+version = "0.1.0"
+dependencies = [
+ "biblatex",
+ "grobid",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -7438,7 +7450,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
- "grobid",
+ "grobid-bibtex",
  "indicatif",
  "log",
  "ragrig",

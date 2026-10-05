@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **GROBID pre-pass on `grobid-bibtex`** — the pre-pass now uses the shared
+  `grobid-bibtex` crate for extraction, OpenAlex completion and renaming
+  (its `Manifest` and keyed-name policy moved there), instead of depending
+  on `grobid` directly. Behavior is unchanged; OpenAlex lookups are now
+  paced at the keyless pool's 10 requests/s like the other tools. The
+  `grobid` cargo feature keeps its name.
 - **GROBID rename format** — renamed PDFs are now
   `<key> - <full authors> - <title> - <year>`, e.g.
   `Kahle2000 - Brewster Kahle - The Barc model for continuous variables - 2000.pdf`:
@@ -38,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and family names, the title is complete and stripped of syntax characters,
   and the year moves to the end.  Colliding names still number the year
   (`... - 2000 - Title`, `... - 2000-1 - Title`) so authors and title keep
-  their place.  Needs the `grobid` 0.5 dependency.
+  their place.  Needs the `grobid` cargo feature (`grobid-bibtex` 0.1).
 
 ## v1.2.0
 
