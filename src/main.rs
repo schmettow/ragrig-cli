@@ -3210,10 +3210,11 @@ impl Session {
                     "Chunks retrieved: {:?}  |  Documents: {:?}",
                     resp.chunks_retrieved, resp.documents
                 );
+                // `{:.300}` truncates on character boundaries.
                 trace!(
                     "System prompt ({} chars): {:.300}...",
                     resp.system_prompt.len(),
-                    &resp.system_prompt[..300.min(resp.system_prompt.len())]
+                    resp.system_prompt
                 );
                 trace!(
                     "User prompt ({} chars): {}",

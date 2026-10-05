@@ -48,7 +48,7 @@ all = [
 ]
 
 [dependencies]
-ragrig = "1.1"
+ragrig = "1"
 # Optional: GROBID header parsing + OpenAlex completion for `--embed-rename`,
 # with the extraction, completion, renaming and fingerprint-manifest helpers
 # of grobid-bibtex.  The path serves local co-development; publish

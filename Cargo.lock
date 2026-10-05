@@ -3822,6 +3822,8 @@ dependencies = [
 [[package]]
 name = "grobid"
 version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab0cdc5503032b771a1d3047cdadfb8e978d508ac9a997c8b69a4fc34c6be937"
 dependencies = [
  "reqwest 0.13.5",
  "roxmltree",
@@ -3834,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "grobid-bibtex"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "biblatex",
  "grobid",
@@ -4104,9 +4106,9 @@ checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "html-to-markdown-rs"
-version = "3.16.0"
+version = "3.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74c4d770081ede1c6ec100e61a57cac65bf41d28ab5516b1eae907b9f3415778"
+checksum = "1018d58b647013e9968c46a6625321611c9026df6a44e12cea4c83b207c5e2bb"
 dependencies = [
  "ahash",
  "astral-tl",
@@ -7049,9 +7051,9 @@ dependencies = [
 
 [[package]]
 name = "powerfmt"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
+checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
 name = "ppmd-rust"
@@ -7397,9 +7399,9 @@ dependencies = [
 
 [[package]]
 name = "ragrig"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6451b5c269cb6beee817fdbcebb6b3f00e136dd98b844abde5d737cdd78858f6"
+checksum = "7123550c773bdc48bec33c472f8c050c43783b532497355e9d869aebcebbfbde"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -9576,9 +9578,9 @@ dependencies = [
 
 [[package]]
 name = "twox-hash"
-version = "2.1.4"
+version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 dependencies = [
  "rand 0.10.3",
 ]
@@ -9666,9 +9668,9 @@ checksum = "a7b3c5d5402af48b31a5631b055de44fe97ddede8f7876c36b2e6ea23e1dd503"
 
 [[package]]
 name = "unicase"
-version = "2.9.0"
+version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-bidi"
