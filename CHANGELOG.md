@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## v1.2.0
+
 ### Added
 
 - **`/embed update`** — incremental re-index: runs the GROBID pre-pass for
