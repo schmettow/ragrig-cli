@@ -477,6 +477,75 @@ enum Command {
     Exit,
 }
 
+/// A parsed `/embed` invocation.
+///
+/// `/embed` overloads one namespace with keyword subcommands (`show`,
+/// `index`, …), two tuning setters (`topk`, `threshold`) and a free-form
+/// `<backend> [model]` spec.  Parsing the line up front — and only treating
+/// the first token as a backend once it is known *not* to be a keyword —
+/// keeps a tuning parameter such as the threshold from ever being handed to
+/// [`EmbedderSpec::parse`] as if it were an embedding backend.
+#[derive(Debug, PartialEq, Eq)]
+enum EmbedCommand<'a> {
+    /// No arguments: print the current embedder and the usage string.
+    Status,
+    /// `/embed show` — print the full embed and chunking settings.
+    Show,
+    /// `/embed purge` — clear the vector store.
+    Purge,
+    /// `/embed index` — (re)build the index for the active corpora.
+    Index,
+    /// `/embed update` — index only new and changed documents.
+    Update,
+    /// `/embed topk <N>` — set the number of chunks injected per query.
+    TopK(&'a str),
+    /// `/embed threshold <F>` — set the cosine similarity pre-filter.
+    Threshold(&'a str),
+    /// `/embed <backend> [model]` — hot-swap the embedding backend.
+    Backend {
+        backend: &'a str,
+        model: Option<&'a str>,
+    },
+}
+
+impl<'a> EmbedCommand<'a> {
+    /// Parse the text after `/embed`.
+    ///
+    /// `Err` carries a user-facing message and is returned only for a
+    /// malformed backend spec (a stray third argument); everything else is
+    /// routed to an arm that either acts or prints its own usage line.
+    fn parse(args: &'a str) -> Result<Self, String> {
+        let mut parts = args.split_whitespace();
+        let head = match parts.next() {
+            None => return Ok(Self::Status),
+            Some(head) => head,
+        };
+
+        // The keyword set is closed, so any token outside it is an embedding
+        // backend.  Matching is case-insensitive for every keyword.
+        match head.to_ascii_lowercase().as_str() {
+            "show" => Ok(Self::Show),
+            "purge" => Ok(Self::Purge),
+            "index" => Ok(Self::Index),
+            "update" => Ok(Self::Update),
+            "topk" | "top_k" | "k" => Ok(Self::TopK(parts.next().unwrap_or(""))),
+            // `threshold` is the short, documented spelling; the full config
+            // spelling is accepted as a forgiving alias.
+            "threshold" | "similarity_threshold" => Ok(Self::Threshold(parts.next().unwrap_or(""))),
+            _ => {
+                let backend = head;
+                let model = parts.next();
+                if let Some(extra) = parts.next() {
+                    return Err(format!(
+                        "unexpected argument '{extra}' — usage: /embed {backend} [model]"
+                    ));
+                }
+                Ok(Self::Backend { backend, model })
+            }
+        }
+    }
+}
+
 // ── Bootstrap: build agents, index documents, enter REPL ───────────────────
 
 /// The PDF backend names compiled into this build — drives the `/parser`
@@ -1359,7 +1428,7 @@ impl Session {
             "/chat <backend> [model] [api_key] | show | context <N> | temperature/top_p/max_tokens/seed — hot-swap chat engine or tune generation"
         );
         println!(
-            "/embed <backend> [model] | show | purge | index | update — hot-swap embedding backend; index re-embeds all, update only new/changed documents"
+            "/embed <backend> [model] | show | purge | index | update | topk <N> | threshold <F> — hot-swap embedding backend; index re-embeds all, update only new/changed documents; topk/threshold tune retrieval"
         );
         println!(
             "/chunker [name] — show or hot-swap the chunking strategy (warns when the pipeline is not indexed)"
@@ -2055,135 +2124,136 @@ impl Session {
     // ── /embed <backend> [model] ──────────────────────────────────────
 
     async fn cmd_embed(&mut self, args_str: &str) -> Result<()> {
-        let mut parts = args_str.split_whitespace();
-        let backend = parts.next().unwrap_or("");
-        if backend.is_empty() {
-            println!(
-                "Embed: {} ({}) — top‑k: {}, threshold: {}",
-                self.session.agent().embedder().backend_name(),
-                self.session.agent().embedder().model_name(),
-                self.session.agent().top_k(),
-                self.session.agent().similarity_threshold(),
-            );
-            println!(
-                "Usage: /embed <backend> [model]  |  show  |  purge  |  index  |  update  |  topk <N>  |  threshold <F>"
-            );
-            println!("  show   — print the full embed and chunking settings");
-            println!(
-                "  index  — (re)build the index for the current parser+chunker+embedder pipeline"
-            );
-            println!(
-                "  update — index only new and changed documents (GROBID rename runs first with --embed-rename)"
-            );
-            println!(
-                "  backends: {}",
-                EmbedderSpec::available_backends().join(", ")
-            );
-            return Ok(());
-        }
-
-        if backend.eq_ignore_ascii_case("show") {
-            let chunk = self.session.agent().chunk_config();
-            println!("Embed settings:");
-            println!(
-                "  backend:              {}",
-                self.session.agent().embedder().backend_name()
-            );
-            println!(
-                "  model:                {}",
-                self.session.agent().embedder().model_name()
-            );
-            println!("  top_k:                {}", self.session.agent().top_k());
-            println!(
-                "  similarity_threshold: {:.3}",
-                self.session.agent().similarity_threshold()
-            );
-            println!(
-                "  chunker:              {}",
-                self.session.agent().chunker().name()
-            );
-            println!("  chunk_size:           {}", chunk.size);
-            println!("  chunk_overlap:        {}", chunk.overlap);
-            println!("  pdf_parser:           {:?}", self.pdf_parser);
-            println!(
-                "  store:                {} chunks",
-                self.session.agent().store().len()
-            );
-            println!(
-                "  grobid_prepass:       {}",
-                match &self.grobid {
-                    Some(cfg) => format!("on ({} — {} workers)", cfg.url, cfg.workers),
-                    None => "off".to_string(),
-                }
-            );
-            println!(
-                "  grobid_rename:        {}",
-                match &self.grobid {
-                    Some(cfg) if cfg.rename => "on",
-                    _ => "off",
-                }
-            );
-            println!(
-                "  bibtex_merge:         {}",
-                match self.grobid.as_ref().and_then(|cfg| cfg.bibtex.as_ref()) {
-                    Some(bibtex) => format!(
-                        "{} (PDF links {})",
-                        bibtex.path.display(),
-                        if bibtex.link { "on" } else { "off" }
-                    ),
-                    None => "off".to_string(),
-                }
-            );
-            return Ok(());
-        }
-
-        if backend.eq_ignore_ascii_case("purge") {
-            let store = self.session.agent().store();
-            let count = store.len();
-            let docs: Vec<_> = store.document_ids().into_iter().collect();
-            for doc in &docs {
-                store.delete_by_document(&doc.0).await?;
+        let command = match EmbedCommand::parse(args_str) {
+            Ok(command) => command,
+            Err(e) => {
+                error!("Embed command error: {}", e);
+                return Ok(());
             }
-            info!(
-                "Vector store purged ({} chunks across {} documents).",
-                count,
-                docs.len()
-            );
-            return Ok(());
-        }
+        };
 
-        if backend.eq_ignore_ascii_case("index") {
-            info!("Re-indexing all active document corpora...");
-            match self.embed_active_corpora(true).await? {
-                Some(stats) => {
-                    info!(
-                        "Re-indexing complete. Store size: {} chunks.",
-                        self.session.agent().store().len()
-                    );
-                    print_index_stats(&stats, "processed");
-                }
-                None => info!("Indexing cancelled."),
+        match command {
+            EmbedCommand::Status => {
+                println!(
+                    "Embed: {} ({}) — top‑k: {}, threshold: {}",
+                    self.session.agent().embedder().backend_name(),
+                    self.session.agent().embedder().model_name(),
+                    self.session.agent().top_k(),
+                    self.session.agent().similarity_threshold(),
+                );
+                println!(
+                    "Usage: /embed <backend> [model]  |  show  |  purge  |  index  |  update  |  topk <N>  |  threshold <F>"
+                );
+                println!("  show   — print the full embed and chunking settings");
+                println!(
+                    "  index  — (re)build the index for the current parser+chunker+embedder pipeline"
+                );
+                println!(
+                    "  update — index only new and changed documents (GROBID rename runs first with --embed-rename)"
+                );
+                println!(
+                    "  backends: {}",
+                    EmbedderSpec::available_backends().join(", ")
+                );
             }
-            return Ok(());
-        }
 
-        if backend.eq_ignore_ascii_case("update") {
-            info!("Updating active document corpora (new and changed documents)...");
-            match self.embed_active_corpora(false).await? {
-                Some(stats) => {
-                    info!(
-                        "Update complete. Store size: {} chunks.",
-                        self.session.agent().store().len()
-                    );
-                    print_index_stats(&stats, "updated");
-                }
-                None => info!("Update cancelled."),
+            EmbedCommand::Show => {
+                let chunk = self.session.agent().chunk_config();
+                println!("Embed settings:");
+                println!(
+                    "  backend:              {}",
+                    self.session.agent().embedder().backend_name()
+                );
+                println!(
+                    "  model:                {}",
+                    self.session.agent().embedder().model_name()
+                );
+                println!("  top_k:                {}", self.session.agent().top_k());
+                println!(
+                    "  threshold:            {:.3}",
+                    self.session.agent().similarity_threshold()
+                );
+                println!(
+                    "  chunker:              {}",
+                    self.session.agent().chunker().name()
+                );
+                println!("  chunk_size:           {}", chunk.size);
+                println!("  chunk_overlap:        {}", chunk.overlap);
+                println!("  pdf_parser:           {:?}", self.pdf_parser);
+                println!(
+                    "  store:                {} chunks",
+                    self.session.agent().store().len()
+                );
+                println!(
+                    "  grobid_prepass:       {}",
+                    match &self.grobid {
+                        Some(cfg) => format!("on ({} — {} workers)", cfg.url, cfg.workers),
+                        None => "off".to_string(),
+                    }
+                );
+                println!(
+                    "  grobid_rename:        {}",
+                    match &self.grobid {
+                        Some(cfg) if cfg.rename => "on",
+                        _ => "off",
+                    }
+                );
+                println!(
+                    "  bibtex_merge:         {}",
+                    match self.grobid.as_ref().and_then(|cfg| cfg.bibtex.as_ref()) {
+                        Some(bibtex) => format!(
+                            "{} (PDF links {})",
+                            bibtex.path.display(),
+                            if bibtex.link { "on" } else { "off" }
+                        ),
+                        None => "off".to_string(),
+                    }
+                );
             }
-            return Ok(());
-        }
 
-        if backend == "topk" {
-            match parts.next().and_then(|s| s.parse::<usize>().ok()) {
+            EmbedCommand::Purge => {
+                let store = self.session.agent().store();
+                let count = store.len();
+                let docs: Vec<_> = store.document_ids().into_iter().collect();
+                for doc in &docs {
+                    store.delete_by_document(&doc.0).await?;
+                }
+                info!(
+                    "Vector store purged ({} chunks across {} documents).",
+                    count,
+                    docs.len()
+                );
+            }
+
+            EmbedCommand::Index => {
+                info!("Re-indexing all active document corpora...");
+                match self.embed_active_corpora(true).await? {
+                    Some(stats) => {
+                        info!(
+                            "Re-indexing complete. Store size: {} chunks.",
+                            self.session.agent().store().len()
+                        );
+                        print_index_stats(&stats, "processed");
+                    }
+                    None => info!("Indexing cancelled."),
+                }
+            }
+
+            EmbedCommand::Update => {
+                info!("Updating active document corpora (new and changed documents)...");
+                match self.embed_active_corpora(false).await? {
+                    Some(stats) => {
+                        info!(
+                            "Update complete. Store size: {} chunks.",
+                            self.session.agent().store().len()
+                        );
+                        print_index_stats(&stats, "updated");
+                    }
+                    None => info!("Update cancelled."),
+                }
+            }
+
+            EmbedCommand::TopK(arg) => match arg.parse::<usize>().ok() {
                 Some(n) if n > 0 => {
                     self.session.agent_mut().set_top_k(n);
                     info!("Top-k set to {}.", n);
@@ -2192,12 +2262,9 @@ impl Session {
                     "Usage: /embed topk <N>  (current: {})",
                     self.session.agent().top_k()
                 ),
-            }
-            return Ok(());
-        }
+            },
 
-        if backend == "threshold" {
-            match parts.next().and_then(|s| s.parse::<f64>().ok()) {
+            EmbedCommand::Threshold(arg) => match arg.parse::<f64>().ok() {
                 Some(f) if f >= 0.0 => {
                     self.session.agent_mut().set_similarity_threshold(f);
                     info!("Similarity threshold set to {:.3}.", f);
@@ -2206,37 +2273,37 @@ impl Session {
                     "Usage: /embed threshold <F>  (current: {:.3})",
                     self.session.agent().similarity_threshold()
                 ),
-            }
-            return Ok(());
-        }
+            },
 
-        let model = parts.next();
+            EmbedCommand::Backend { backend, model } => {
+                let spec = match EmbedderSpec::parse(backend, model) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Embed spec parse error: {}", e);
+                        return Ok(());
+                    }
+                };
 
-        let spec = match EmbedderSpec::parse(backend, model) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Embed spec parse error: {}", e);
-                return Ok(());
+                match spec.build() {
+                    Ok(new_embedder) => {
+                        let old_backend = self.session.agent().embedder().backend_name();
+                        let old_model = self.session.agent().embedder().model_name().to_string();
+                        self.session.agent_mut().set_embedder(new_embedder);
+                        info!(
+                            "Embedder swapped: {} ({}) → {} ({})",
+                            old_backend,
+                            old_model,
+                            self.session.agent().embedder().backend_name(),
+                            self.session.agent().embedder().model_name()
+                        );
+                        // Provenance check: warn when the new embedder has no
+                        // chunks in the store yet — the user must run
+                        // /embed index explicitly.
+                        self.pipeline_indexed().await;
+                    }
+                    Err(e) => RagrigError::log_or(&e, "Failed to build embedder"),
+                }
             }
-        };
-
-        match spec.build() {
-            Ok(new_embedder) => {
-                let old_backend = self.session.agent().embedder().backend_name();
-                let old_model = self.session.agent().embedder().model_name().to_string();
-                self.session.agent_mut().set_embedder(new_embedder);
-                info!(
-                    "Embedder swapped: {} ({}) → {} ({})",
-                    old_backend,
-                    old_model,
-                    self.session.agent().embedder().backend_name(),
-                    self.session.agent().embedder().model_name()
-                );
-                // Provenance check: warn when the new embedder has no chunks
-                // in the store yet — the user must run /embed index explicitly.
-                self.pipeline_indexed().await;
-            }
-            Err(e) => RagrigError::log_or(&e, "Failed to build embedder"),
         }
         Ok(())
     }
@@ -4262,6 +4329,82 @@ mod tests {
     fn parse_embed_no_args_does_not_panic() {
         let cmd = Command::from("/embed");
         assert!(matches!(cmd, Command::Embed(s) if s.is_empty()));
+    }
+
+    // ── EmbedCommand::parse ──────────────────────────────────────────
+
+    #[test]
+    fn embed_parse_empty_is_status() {
+        assert_eq!(EmbedCommand::parse(""), Ok(EmbedCommand::Status));
+        assert_eq!(EmbedCommand::parse("   "), Ok(EmbedCommand::Status));
+    }
+
+    #[test]
+    fn embed_parse_keywords_are_case_insensitive() {
+        assert_eq!(EmbedCommand::parse("show"), Ok(EmbedCommand::Show));
+        assert_eq!(EmbedCommand::parse("SHOW"), Ok(EmbedCommand::Show));
+        assert_eq!(EmbedCommand::parse("Purge"), Ok(EmbedCommand::Purge));
+        assert_eq!(EmbedCommand::parse("index"), Ok(EmbedCommand::Index));
+        assert_eq!(EmbedCommand::parse("update"), Ok(EmbedCommand::Update));
+    }
+
+    #[test]
+    fn embed_parse_threshold_takes_value_and_accepts_long_alias() {
+        assert_eq!(
+            EmbedCommand::parse("threshold 0.03"),
+            Ok(EmbedCommand::Threshold("0.03"))
+        );
+        // Regression: the config/flag spelling used to be handed to
+        // EmbedderSpec::parse as a backend, yielding "Unknown embedding
+        // backend: 'similarity_threshold'" instead of setting the threshold.
+        assert_eq!(
+            EmbedCommand::parse("similarity_threshold 0.03"),
+            Ok(EmbedCommand::Threshold("0.03"))
+        );
+        // A missing value still routes to the setter, which prints its usage.
+        assert_eq!(
+            EmbedCommand::parse("threshold"),
+            Ok(EmbedCommand::Threshold(""))
+        );
+    }
+
+    #[test]
+    fn embed_parse_topk_aliases() {
+        assert_eq!(EmbedCommand::parse("topk 10"), Ok(EmbedCommand::TopK("10")));
+        assert_eq!(
+            EmbedCommand::parse("top_k 10"),
+            Ok(EmbedCommand::TopK("10"))
+        );
+        assert_eq!(EmbedCommand::parse("k 10"), Ok(EmbedCommand::TopK("10")));
+    }
+
+    #[test]
+    fn embed_parse_backend_with_optional_model() {
+        assert_eq!(
+            EmbedCommand::parse("ollama nomic-embed-text"),
+            Ok(EmbedCommand::Backend {
+                backend: "ollama",
+                model: Some("nomic-embed-text"),
+            })
+        );
+        assert_eq!(
+            EmbedCommand::parse("none"),
+            Ok(EmbedCommand::Backend {
+                backend: "none",
+                model: None,
+            })
+        );
+    }
+
+    #[test]
+    fn embed_parse_rejects_stray_backend_argument() {
+        // Regression: `/embed ollama similarity_threshold 0.03` used to swallow
+        // the threshold as the model name and silently drop the value.
+        let err = EmbedCommand::parse("ollama similarity_threshold 0.03").unwrap_err();
+        assert!(
+            err.contains("0.03"),
+            "the help message should name the stray argument, got: {err}"
+        );
     }
 
     #[test]

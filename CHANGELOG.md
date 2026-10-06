@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **`/embed` argument parsing** — `/embed` now resolves its keyword
+  subcommands (`show`, `purge`, `index`, `update`, `topk`, `threshold`)
+  case-insensitively and *before* falling back to a `<backend> [model]`
+  spec, so a tuning keyword can never again be mistaken for an embedding
+  backend.  `similarity_threshold` is accepted as an alias for
+  `threshold` (the spelling users reach for after seeing the config field
+  and CLI flag), a stray third token such as
+  `/embed ollama similarity_threshold 0.03` is rejected instead of being
+  silently swallowed as the model name while the value was dropped, and
+  `/embed show` now labels the value `threshold:` to match `/search`.
+
 ### Added
 
 - **`--bibtex-merge <FILE>`** (with the `grobid` cargo feature) — maintain a
