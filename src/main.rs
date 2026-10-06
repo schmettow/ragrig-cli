@@ -33,7 +33,7 @@ use tracing_subscriber::{self, EnvFilter, fmt};
 
 mod grobid;
 mod search;
-use grobid::GrobidRenameConfig;
+use grobid::GrobidPrepassConfig;
 use search::{search_arxiv, search_semantic_scholar};
 
 // ── CLI parsing (binary-only) ──────────────────────────────────────────────
@@ -146,6 +146,17 @@ struct Cli {
     /// Maximum number of concurrent GROBID/OpenAlex requests.
     #[arg(long, default_value = "4", value_name = "N")]
     pub grobid_workers: usize,
+
+    /// Maintain this BibTeX file for the directory corpora: every PDF that
+    /// the GROBID pre-pass processes has its reference merged in — entries
+    /// already present are skipped, new ones appended, and a missing file is
+    /// created.  Requires a build with the `grobid` cargo feature and (only
+    /// for new or changed PDFs) a running server.
+    #[arg(long = "bibtex-merge", value_name = "FILE")]
+    pub bibtex_merge: Option<PathBuf>,
+    /// Do not record the PDF path in a `file` field of merged BibTeX entries.
+    #[arg(long = "bibtex-no-link", requires = "bibtex_merge")]
+    pub bibtex_no_link: bool,
 
     /// Start in demo mode: the small llama3.2:3b chat model with a 4096-token
     /// context (fits an 8 GB GPU), memory off, and the embedded HTML fixture
@@ -418,9 +429,10 @@ struct Session {
     /// Named document corpora (`--corpus-dir` / `--corpus-urls`), toggled
     /// with `/corpus <name> on|off`.
     corpora: Vec<CorpusEntry>,
-    /// GROBID pre-pass (`--embed-rename`): parse PDF headers, complete them
-    /// against OpenAlex, and rename files before indexing a directory corpus.
-    grobid_rename: Option<GrobidRenameConfig>,
+    /// GROBID pre-pass (`--embed-rename` / `--bibtex-merge`): parse PDF
+    /// headers, complete them against OpenAlex, rename files and/or merge
+    /// their records into a BibTeX file before indexing a directory corpus.
+    grobid: Option<GrobidPrepassConfig>,
     /// Dynamic routing for web downloads (`/corpus dyn on|off`).  When on,
     /// `/download` and `/get` route documents into the first active URL
     /// corpus (else the first active directory corpus) instead of the main
@@ -457,6 +469,9 @@ enum Command {
     Prompt(String),
     Corpus(String),
     Log(String),
+    /// `/bibtex [show | merge]` — status of the BibTeX merge target, or run
+    /// the GROBID pre-pass (and merge) for every active directory corpus.
+    Bibtex(String),
     RagQuery(String),
     Unknown(String),
     Exit,
@@ -635,8 +650,21 @@ fn parse_corpora(
 async fn bootstrap(
     config: RagrigConfig,
     log_level: Arc<RwLock<String>>,
-    grobid_rename: Option<GrobidRenameConfig>,
+    grobid: Option<GrobidPrepassConfig>,
 ) -> Result<Session> {
+    // Parse the BibTeX merge target before any indexing: a missing file is
+    // an empty collection, a corrupt one aborts startup right here.
+    if let Some(bibtex) = grobid.as_ref().and_then(|cfg| cfg.bibtex.as_ref()) {
+        let count = grobid::bibtex_entry_count(bibtex)?;
+        info!(
+            "BibTeX merge target: {} ({} existing entr{}, PDF links {}).",
+            bibtex.path.display(),
+            count,
+            if count == 1 { "y" } else { "ies" },
+            if bibtex.link { "on" } else { "off" }
+        );
+    }
+
     // Build generation params from config.
     let chat_params = config.chat.params.clone();
     debug!(
@@ -763,7 +791,7 @@ async fn bootstrap(
     }
     for entry in corpora.iter().filter(|e| e.active) {
         if let CorpusKind::Dir(folder) = &entry.kind {
-            grobid::rename_pdfs(grobid_rename.as_ref(), folder.folder()).await?;
+            grobid::prepass(grobid.as_ref(), folder.folder()).await?;
         }
         info!("Indexing corpus '{}' ({}).", entry.name, entry.kind.label());
         let token = CancellationToken::new();
@@ -833,7 +861,7 @@ async fn bootstrap(
         attached_docs: Vec::new(),
         corpora,
         dyn_corpora: true,
-        grobid_rename,
+        grobid,
         doc_parsers,
         pdf_parser,
         epub_parser: EpubParserBackend::Epub,
@@ -928,6 +956,9 @@ impl From<&str> for Command {
         if input.starts_with("/profile") {
             return Command::Profile(after("/profile").trim().to_string());
         }
+        if input.starts_with("/bibtex") {
+            return Command::Bibtex(after("/bibtex").trim().to_string());
+        }
 
         // Any other slash‑prefixed input is an unknown command, not a query.
         Command::Unknown(input.to_string())
@@ -1018,6 +1049,7 @@ impl Session {
             Command::Log(args_str) => self.cmd_log(&args_str).await,
             Command::Parser(args_str) => self.cmd_parser(&args_str).await,
             Command::Profile(args_str) => self.cmd_profile(&args_str).await,
+            Command::Bibtex(args_str) => self.cmd_bibtex(&args_str).await,
             Command::Corpus(args_str) => self.cmd_corpus(&args_str).await,
             Command::RagQuery(q) => self.cmd_rag_query(&q).await,
             Command::Unknown(cmd) => {
@@ -1177,7 +1209,7 @@ impl Session {
                 // The main folder is indexed as the "folder" corpus, so the
                 // GROBID pre-pass applies here just like to a named
                 // directory corpus.
-                grobid::rename_pdfs(self.grobid_rename.as_ref(), &folder).await?;
+                grobid::prepass(self.grobid.as_ref(), &folder).await?;
                 let corpus = FolderCorpus::named("folder", &folder);
                 let token = CancellationToken::new();
                 let watcher = EscWatcher::spawn(token.clone());
@@ -1349,6 +1381,9 @@ impl Session {
         println!("/profile save|show|load|list [name] — manage configuration profiles");
         println!(
             "/corpus <name> on|off — toggle a named document corpus (--corpus-dir / --corpus-urls); /corpus dyn on|off — dynamic web-download routing"
+        );
+        println!(
+            "/bibtex show | merge — show the --bibtex-merge target, or run the GROBID pre-pass (and merge) for all active directory corpora"
         );
         println!("exit / quit     — end the session");
     }
@@ -2075,9 +2110,27 @@ impl Session {
                 self.session.agent().store().len()
             );
             println!(
-                "  grobid_rename:        {}",
-                match &self.grobid_rename {
+                "  grobid_prepass:       {}",
+                match &self.grobid {
                     Some(cfg) => format!("on ({} — {} workers)", cfg.url, cfg.workers),
+                    None => "off".to_string(),
+                }
+            );
+            println!(
+                "  grobid_rename:        {}",
+                match &self.grobid {
+                    Some(cfg) if cfg.rename => "on",
+                    _ => "off",
+                }
+            );
+            println!(
+                "  bibtex_merge:         {}",
+                match self.grobid.as_ref().and_then(|cfg| cfg.bibtex.as_ref()) {
+                    Some(bibtex) => format!(
+                        "{} (PDF links {})",
+                        bibtex.path.display(),
+                        if bibtex.link { "on" } else { "off" }
+                    ),
                     None => "off".to_string(),
                 }
             );
@@ -2208,7 +2261,7 @@ impl Session {
         let mut all_stats: Vec<FileIndexResult> = Vec::new();
         for entry in self.corpora.iter().filter(|e| e.active) {
             if let CorpusKind::Dir(folder) = &entry.kind {
-                grobid::rename_pdfs(self.grobid_rename.as_ref(), folder.folder()).await?;
+                grobid::prepass(self.grobid.as_ref(), folder.folder()).await?;
             }
             let verb = if full { "Re-indexing" } else { "Updating" };
             info!("{} corpus '{}' ({}).", verb, entry.name, entry.kind.label());
@@ -2834,7 +2887,7 @@ impl Session {
     /// Returns the number of documents indexed.
     async fn sync_corpus_entry(&mut self, idx: usize) -> Result<usize> {
         if let CorpusKind::Dir(folder) = &self.corpora[idx].kind {
-            grobid::rename_pdfs(self.grobid_rename.as_ref(), folder.folder()).await?;
+            grobid::prepass(self.grobid.as_ref(), folder.folder()).await?;
         }
         let token = CancellationToken::new();
         let watcher = EscWatcher::spawn(token.clone());
@@ -2889,6 +2942,66 @@ impl Session {
         self.session.agent().store().delete_corpus(name).await?;
         println!("Corpus '{name}' is off; its chunks were removed from the store.");
         Ok(())
+    }
+
+    // ── /bibtex [show | merge] ───────────────────────────────────────
+
+    /// Show the BibTeX merge target, or run the GROBID pre-pass (including
+    /// the merge) for every active directory corpus.
+    ///
+    /// `merge` is the manual equivalent of the automatic merge that runs
+    /// before `/embed index` and `/embed update`: new and changed PDFs are
+    /// parsed (unless only cached records need merging), then all records are
+    /// merged into the `.bib` file.
+    async fn cmd_bibtex(&mut self, args_str: &str) -> Result<()> {
+        let Some(bibtex) = self.grobid.as_ref().and_then(|cfg| cfg.bibtex.as_ref()) else {
+            println!(
+                "No BibTeX merge target configured — start with --bibtex-merge <FILE> \
+                 (requires the `grobid` cargo feature)."
+            );
+            return Ok(());
+        };
+        match args_str.trim() {
+            "" | "show" => {
+                let count = grobid::bibtex_entry_count(bibtex)?;
+                println!(
+                    "BibTeX merge target: {} ({} entries, PDF links {}).",
+                    bibtex.path.display(),
+                    count,
+                    if bibtex.link { "on" } else { "off" }
+                );
+                println!("Usage: /bibtex show | merge");
+                Ok(())
+            }
+            "merge" => {
+                let mut corpora = 0usize;
+                for entry in self.corpora.iter().filter(|e| e.active) {
+                    if let CorpusKind::Dir(folder) = &entry.kind {
+                        corpora += 1;
+                        grobid::prepass(self.grobid.as_ref(), folder.folder()).await?;
+                    }
+                }
+                let count = grobid::bibtex_entry_count(bibtex)?;
+                if corpora == 0 {
+                    println!(
+                        "No active directory corpora — nothing to merge; {} has {} entries.",
+                        bibtex.path.display(),
+                        count
+                    );
+                } else {
+                    println!(
+                        "BibTeX merge complete: {} ({} entries).",
+                        bibtex.path.display(),
+                        count
+                    );
+                }
+                Ok(())
+            }
+            other => {
+                println!("Usage: /bibtex show | merge (got '{other}')");
+                Ok(())
+            }
+        }
     }
 
     // ── /profile [save|show|load|list] [name] ────────────────────
@@ -3335,20 +3448,14 @@ async fn main() -> Result<()> {
     let profile_name = cli.profile.clone();
     // The GROBID pre-pass is CLI-only (like `--demo`): it is not part of the
     // library `RagrigConfig`, so extract it before the config conversion.
-    let grobid_rename = if cli.embed_rename {
-        if !cfg!(feature = "grobid") {
-            anyhow::bail!(
-                "`--embed-rename` needs a build with the `grobid` cargo feature: \
-                 cargo install ragrig-cli --features grobid (or cargo build --features grobid)"
-            );
-        }
-        Some(GrobidRenameConfig {
-            url: cli.grobid_url.clone(),
-            workers: cli.grobid_workers.max(1),
-        })
-    } else {
-        None
-    };
+    let prepass = grobid::resolve_prepass(
+        cli.embed_rename,
+        cli.bibtex_merge.as_deref(),
+        !cli.bibtex_no_link,
+        &cli.grobid_url,
+        cli.grobid_workers,
+        cfg!(feature = "grobid"),
+    )?;
     let mut cli_config: RagrigConfig = cli.into();
     #[cfg(feature = "test-fixtures")]
     let _demo_fixtures = apply_demo_setup(demo, had_explicit_corpora, &mut cli_config)?;
@@ -3428,7 +3535,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let mut session = bootstrap(config, stderr_level, grobid_rename).await?;
+    let mut session = bootstrap(config, stderr_level, prepass).await?;
 
     if demo {
         // Memory off: no query rewriting, no transcript accumulation — every
@@ -3861,6 +3968,16 @@ mod tests {
         assert!(matches!(off, Command::Corpus(s) if s == "dyn off"));
     }
 
+    #[test]
+    fn parse_bibtex_command_recognised() {
+        let cmd = Command::from("/bibtex");
+        assert!(matches!(cmd, Command::Bibtex(s) if s.is_empty()));
+        let cmd = Command::from("/bibtex show");
+        assert!(matches!(cmd, Command::Bibtex(s) if s == "show"));
+        let cmd = Command::from("/bibtex merge");
+        assert!(matches!(cmd, Command::Bibtex(s) if s == "merge"));
+    }
+
     // ── CLI clap parsing (--corpus-dir / --corpus-urls) ───────────────
 
     #[test]
@@ -3896,6 +4013,49 @@ mod tests {
             config.corpus_urls,
             vec!["urls=https://example.com/a.pdf,https://example.com/b.pdf"]
         );
+    }
+
+    #[test]
+    fn cli_parses_bibtex_flags() {
+        // Default: no BibTeX merge target, linking on.
+        let cli = Cli::try_parse_from(["ragrig"]).expect("bare CLI parses");
+        assert!(cli.bibtex_merge.is_none());
+        assert!(!cli.bibtex_no_link);
+
+        let cli = Cli::try_parse_from(["ragrig", "--bibtex-merge", "refs.bib", "--bibtex-no-link"])
+            .expect("CLI args should parse");
+        assert_eq!(cli.bibtex_merge, Some(PathBuf::from("refs.bib")));
+        assert!(cli.bibtex_no_link);
+
+        // --bibtex-no-link alone is a usage error, not silently ignored.
+        assert!(
+            Cli::try_parse_from(["ragrig", "--bibtex-no-link"]).is_err(),
+            "--bibtex-no-link requires --bibtex-merge"
+        );
+
+        // The flags combine with --embed-rename and survive into the
+        // pre-pass configuration.
+        let cli = Cli::try_parse_from([
+            "ragrig",
+            "--embed-rename",
+            "--bibtex-merge",
+            "/tmp/refs.bib",
+        ])
+        .expect("CLI args should parse");
+        let prepass = grobid::resolve_prepass(
+            cli.embed_rename,
+            cli.bibtex_merge.as_deref(),
+            !cli.bibtex_no_link,
+            &cli.grobid_url,
+            cli.grobid_workers,
+            true,
+        )
+        .expect("resolve")
+        .expect("configured");
+        assert!(prepass.rename);
+        let bibtex = prepass.bibtex.expect("target");
+        assert_eq!(bibtex.path, PathBuf::from("/tmp/refs.bib"));
+        assert!(bibtex.link);
     }
 
     // ── parse_corpora ─────────────────────────────────────────────────
@@ -4339,7 +4499,7 @@ mod tests {
             context_size_forced: ContextSizeMode::Auto,
             attached_docs: Vec::new(),
             corpora,
-            grobid_rename: None,
+            grobid: None,
             dyn_corpora: true,
             log_level: Arc::new(RwLock::new("warn".into())),
         }
@@ -4398,6 +4558,79 @@ mod tests {
         session.cmd_memory("show").await.unwrap();
 
         assert!(session.session.turns().is_empty());
+    }
+
+    /// `/bibtex` without a configured target reports guidance instead of
+    /// failing, whatever subcommand is given.
+    #[cfg(feature = "internal")]
+    #[tokio::test]
+    async fn bibtex_command_without_target_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = cli_session(dir.path(), Vec::new());
+
+        session.cmd_bibtex("show").await.unwrap();
+        session.cmd_bibtex("merge").await.unwrap();
+        session.cmd_bibtex("bogus").await.unwrap();
+
+        assert!(session.session.turns().is_empty());
+    }
+
+    /// `/bibtex merge` runs the pre-pass for active directory corpora; a
+    /// cached record is merged into the file without a GROBID server.
+    #[cfg(all(feature = "internal", feature = "grobid"))]
+    #[tokio::test]
+    async fn bibtex_command_merges_cached_records() {
+        use grobid_bibtex::files::Manifest;
+        use grobid_bibtex::{Author, Biblio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let corpus_dir = dir.path().join("papers");
+        fs::create_dir(&corpus_dir).unwrap();
+        let pdf = corpus_dir.join("scan.pdf");
+        fs::write(&pdf, b"%PDF-1.4 fake").unwrap();
+        let biblio = Biblio {
+            authors: vec![Author {
+                surname: Some("Kahle".into()),
+                ..Author::default()
+            }],
+            date: Some("2000".into()),
+            title: Some("The Barc model".into()),
+            ..Biblio::default()
+        };
+        let mut manifest = Manifest::empty(corpus_dir.join(".ragrig_grobid.json"));
+        manifest.record_with_biblio(&corpus_dir, &pdf, &biblio);
+        manifest.save().unwrap();
+
+        let bib = dir.path().join("refs.bib");
+        let mut session = cli_session(
+            dir.path(),
+            vec![CorpusEntry {
+                name: "papers".into(),
+                kind: CorpusKind::Dir(FolderCorpus::new(corpus_dir)),
+                active: true,
+            }],
+        );
+        session.grobid = Some(GrobidPrepassConfig {
+            // Nothing listens here: the cached merge must not probe.
+            url: "http://127.0.0.1:1".into(),
+            workers: 1,
+            rename: false,
+            bibtex: Some(grobid::BibtexMergeConfig {
+                path: bib.clone(),
+                link: true,
+            }),
+        });
+
+        session.cmd_bibtex("merge").await.unwrap();
+        let text = fs::read_to_string(&bib).unwrap();
+        assert!(text.contains("@misc{Kahle2000,"), "{text}");
+        assert!(text.contains("file = {"), "{text}");
+        assert!(text.contains("scan.pdf"), "{text}");
+
+        // A second merge is idempotent; show reports the entry count.
+        session.cmd_bibtex("merge").await.unwrap();
+        assert_eq!(fs::read_to_string(&bib).unwrap(), text);
+        session.cmd_bibtex("show").await.unwrap();
     }
 
     /// A transcript-strategy profile must leave the transcript on — this is

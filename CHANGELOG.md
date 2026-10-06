@@ -13,6 +13,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- **`--bibtex-merge <FILE>`** (with the `grobid` cargo feature) — maintain a
+  BibTeX file for the directory corpora: every PDF that the GROBID pre-pass
+  processes has its reference merged into `FILE` with the duplicate detection
+  of `pdf2bibtex --merge` (normalized field content, DOI/PMID/arXiv
+  identifier, PDF file name).  Existing entries are skipped, new ones are
+  appended with collision-free keys and — unless `--bibtex-no-link` is given
+  — a `file` field pointing at the PDF; a missing file is created on the
+  first merge, and entries are never rewritten or pruned.  The flag is
+  independent of `--embed-rename` (either one runs the pre-pass) and merges
+  wherever the pre-pass runs — at startup, on `/corpus <name> on`, before
+  `/embed index` and `/embed update`, and after `/download`/`/get` — plus on
+  demand with the new **`/bibtex show | merge`** REPL command.
+- **Cached records in the GROBID manifest** — `.ragrig_grobid.json` now
+  stores each processed PDF's extracted, OpenAlex-completed record next to
+  its fingerprint, in a JSON that stays compatible with older manifests.
+  Unchanged PDFs are merged into the BibTeX file from that cache without
+  contacting GROBID: a deleted `.bib` is rebuilt offline, and enabling
+  `--bibtex-merge` after a rename-only run refreshes the cache once.  The
+  cached metadata is general `grobid-bibtex` functionality (`Manifest`
+  records, `collection::merge_file`), which `pdf2bibtex --merge` now uses as
+  well.
+
 ## v1.3.0
 
 ### Added

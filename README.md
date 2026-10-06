@@ -178,6 +178,47 @@ INFO GROBID pre-pass done: 2 of 2 PDF(s) renamed, 1 OpenAlex-completed, 0 failed
   rename keeps the original path.  Only an unreachable GROBID server aborts
   startup.
 
+### BibTeX bibliography (`--bibtex-merge`)
+
+With the same `grobid` feature, `--bibtex-merge <FILE>` maintains a BibTeX
+file for the directory corpora:
+
+```bash
+ragrig-cli --folder ~/papers --bibtex-merge ~/papers/refs.bib
+```
+
+Every PDF that the pre-pass processes has its reference merged into `<FILE>`
+with the duplicate detection of `pdf2bibtex --merge`: records that are
+already in the file — matched by normalized field content, DOI/PMID/arXiv
+identifier or PDF file name — are skipped, new records are appended with
+collision-free citation keys, and a missing file is created on the first
+merge.  Unless `--bibtex-no-link` is given, each entry records the path of
+its PDF in a `file` field (pointing at the renamed name when `--embed-rename`
+is on).  Entries are never rewritten or pruned: the file is a bibliography
+that grows with the corpus.
+
+- `--bibtex-merge` and `--embed-rename` are independent: either flag runs the
+  pre-pass, so you can maintain the bibliography without renaming files — or
+  rename without a bibliography.
+- Merging runs wherever the pre-pass runs: at startup for every active
+  directory corpus, on `/corpus <name> on`, before `/embed index` and
+  `/embed update`, and after `/download` or `/get` saved a file into a
+  directory corpus or the main folder.  `/bibtex` shows the target and its
+  entry count, `/bibtex merge` re-runs the pre-pass (and merge) for all
+  active directory corpora on demand — the merge also happens during
+  interactive sessions.
+- The pre-pass stores each processed PDF's extracted, OpenAlex-completed
+  record in `.ragrig_grobid.json` next to its fingerprint (the JSON stays
+  compatible with older manifests).  Unchanged PDFs are merged from that
+  cache without contacting GROBID, so a deleted `.bib` is rebuilt offline,
+  and enabling `--bibtex-merge` after a rename-only run refreshes the cache
+  once.  Only new or changed PDFs hit the server.
+- A `.bib` file that exists but cannot be parsed aborts startup before any
+  indexing; GROBID and OpenAlex failures degrade exactly as with
+  `--embed-rename` (skipped PDFs are retried on the next run).
+- Documents from URL corpora and non-PDF files have no local PDF to link and
+  are not merged.
+
 ### Demo mode
 
 Try ragrig against a real book without any of your own documents:
@@ -506,7 +547,11 @@ Options:
                                    Key - Full authors - Full title - Year (requires --features grobid
                                    and a running server)
       --grobid-url <URL>           GROBID server base URL [default: http://localhost:8070]
-      --grobid-workers <N>         Concurrent GROBID/OpenAlex requests for --embed-rename [default: 4]
+      --grobid-workers <N>         Concurrent GROBID/OpenAlex requests for the GROBID pre-pass [default: 4]
+      --bibtex-merge <FILE>        Maintain a BibTeX file: merge every processed PDF's reference
+                                   into FILE, skipping entries that are already there (requires
+                                   --features grobid; missing files are created)
+      --bibtex-no-link             Do not record the PDF path in a file field of merged entries
 ```
 
 ---
