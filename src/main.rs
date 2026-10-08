@@ -1136,7 +1136,7 @@ impl Session {
     /// next query (unless re-attached).
     ///
     /// Usage:
-    ///   /attach <file>            — attach a PDF, EPUB, DOCX, HTML or MD file,
+    ///   /attach `<file>`          — attach a PDF, EPUB, DOCX, HTML or MD file,
     ///                               or any other UTF-8 text file (e.g. .bib)
     ///   /attach                  — show currently attached files
     ///   /attach clear            — clear all attachments
@@ -3472,7 +3472,7 @@ impl Session {
 
 /// The chat model `--demo` uses: ~2.2 GB at Q4, so it sits on an 8 GB GPU
 /// with plenty of headroom for the 4096-token context and KV cache
-/// (https://localaimaster.com/vram/best-ollama-models-8gb-vram).
+/// (<https://localaimaster.com/vram/best-ollama-models-8gb-vram>).
 const DEMO_CHAT_MODEL: &str = "llama3.2:3b";
 
 /// The first question `--demo` prefills into the prompt line.
@@ -3947,7 +3947,7 @@ fn strip_ansi(input: &str) -> String {
     result
 }
 
-/// Parse "1,2,3-4,8" into zero-based indices [0,1,2,3,7]
+/// Parse "1,2,3-4,8" into zero-based indices `[0,1,2,3,7]`
 fn parse_number_range(input: &str) -> Result<Vec<usize>, String> {
     let mut indices = Vec::new();
     for part in input.split(',') {

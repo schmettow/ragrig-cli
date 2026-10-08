@@ -11,7 +11,7 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## v1.4.0
 
 ### Fixed
 
@@ -49,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached metadata is general `grobid-bibtex` functionality (`Manifest`
   records, `collection::merge_file`), which `pdf2bibtex --merge` now uses as
   well.
+
+### Quality
+
+- **Test coverage** (`cargo llvm-cov --features all,offline`; the single
+  `src/main.rs` test target — the crate has no integration or doc tests):
+  `grobid.rs` 89.7%, `main.rs` 35.8% and `search.rs` 0.0% line coverage —
+  41.7% overall.  `main.rs` is the REPL driver (bootstrap, command
+  dispatch, the live Ollama and embedding paths) and `search.rs` the live
+  arXiv/Semantic Scholar clients; both are exercised through the REPL
+  rather than unit tests, while the parsing, profile and GROBID pre-pass
+  logic the tests target is well covered (`grobid.rs` ~90%).
+- **Verification**: `cargo fmt --check`, `cargo check --all-targets
+  --features all,offline`, `cargo clippy --all-targets --features
+  all,offline -- -D warnings`, `cargo doc --no-deps --features all,offline`
+  (with `RUSTDOCFLAGS="-D warnings"`) and `cargo test --features
+  all,offline` (69 unit tests pass, 1 ignored — it needs a live Ollama
+  model) all pass.  `cargo package --list` ships the expected 12 files,
+  and `cargo publish --dry-run` packages and verifies the crate
+  (536.3 KiB, 136.4 KiB compressed) with `ragrig` 1.1.1 and
+  `grobid-bibtex` 0.2.0 resolved from crates.io.  `--all-features` cannot
+  build on this Linux host: the `internal-generate-metal`/`offline-metal`
+  features pull in the macOS-only `objc2`, and the CUDA/MKL variants need
+  toolkits that are not installed; `all,offline` enables every other
+  feature.
 
 ## v1.3.0
 

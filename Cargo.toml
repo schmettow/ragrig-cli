@@ -1,6 +1,6 @@
 [package]
 name = "ragrig-cli"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 rust-version = "1.89"
 description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
@@ -52,7 +52,7 @@ ragrig = "1"
 # Optional: GROBID header parsing + OpenAlex completion for `--embed-rename`,
 # with the extraction, completion, renaming and fingerprint-manifest helpers
 # of grobid-bibtex.  The path serves local co-development; publish
-# grobid-bibtex 0.1 before ragrig-cli.
+# grobid-bibtex 0.2 before ragrig-cli.
 grobid-bibtex = { version = "0.2", path = "../grobid-bibtex", optional = true }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
