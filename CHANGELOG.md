@@ -11,6 +11,25 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.5.0
+
+### Added
+
+- **Citation attach in chat (`@key`)** — with the `grobid` cargo feature and
+  the GROBID pre-pass configured (`--embed-rename` and/or `--bibtex-merge`),
+  a plain query may mention citation keys, e.g. `Compare @Kano2022 with the
+  corpus`.  ragrig resolves the key against the BibTeX file (exact spelling
+  first, then case-insensitively), locates the paper's PDF — from the
+  entry's `file` field, or from the keyed file name of `--embed-rename` in
+  the active directory corpora — parses it with the session's parser and
+  attaches the full text to the prompt alongside the retrieved chunks.
+  Mentions are one-shot and deduplicated, only files inside the active
+  corpora are used, misses warn instead of failing the query, and an
+  attachment set larger than the context budget warns before generation.
+  `/bibtex attach on|off` toggles the behaviour, `/bibtex find <key>`
+  resolves a key without attaching (both work without a merge target).
+  Requires `grobid-bibtex` 0.2.1 (`Collection::cite_entries`).
+
 ## v1.4.0
 
 ### Fixed

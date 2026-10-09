@@ -219,6 +219,40 @@ that grows with the corpus.
 - Documents from URL corpora and non-PDF files have no local PDF to link and
   are not merged.
 
+#### Citation attach in chat (`@key`)
+
+While the pre-pass is configured (`--embed-rename` and/or `--bibtex-merge`),
+a question may mention citation keys directly.  Every `@key` mention resolves
+the key, finds the paper's PDF in the active corpora, parses it with the
+session's parser, and attaches the full text to the prompt — alongside the
+retrieved chunks:
+
+```text
+Query > Compare the sample size in @Kano2022 with @Smith2020.
+Citation: @Kano2022 → papers/Kano2022 - Kano, Konno - A study of X - 2022.pdf (51230 chars ≈ 17076 tokens)
+Citation: @Smith2020 → papers/Smith2020 - Smith - Another study - 2020.pdf (39840 chars ≈ 13280 tokens)
+--- 12 chunks | 45 tokens + 2 attached doc(s) in 8.2s ---
+```
+
+- Keys resolve against the `--bibtex-merge` file — exact spelling first,
+  then case-insensitively.  The PDF comes from the entry's `file` field, or
+  — when that is missing or stale — from a keyed file name (`Key - …`, as
+  `--embed-rename` writes it) in the active directory corpora.  Only files
+  inside the active corpora are used.
+- Mentions are one-shot: every question that names a key attaches its paper
+  again.  Misses (unknown key, no local PDF, unreadable PDF) are reported
+  as warnings; a failed lookup never fails the question.
+- `/bibtex attach off` disables the behaviour, `/bibtex attach on` enables
+  it again, and `/bibtex find <key>` shows where a key resolves — with or
+  without the toggle.
+- Attachments are merged after the retrieval budget is spent.  ragrig warns
+  when they alone exceed the context window; raise it with
+  `/chat context <N>` or mention fewer keys.
+- Collision keys (`Smith2020-2`) whose files were renamed without the key
+  suffix can be ambiguous: keep the default `file` links
+  (`--bibtex-merge` without `--bibtex-no-link`), or add a file named
+  `<key> - …` to disambiguate.
+
 ### Demo mode
 
 Try ragrig against a real book without any of your own documents:
@@ -423,6 +457,7 @@ under a pipeline that has not been indexed yet is an error.
 | `/log [off\|error\|warn\|info\|debug\|trace]` | Show or change log verbosity at runtime |
 | `/profile save\|show\|load\|list [name]` | Manage configuration profiles |
 | `/corpus <name> on\|off \| dyn on\|off` | Toggle a named corpus (index/remove its chunks) or dynamic web-download routing |
+| `/bibtex show \| merge \| attach on\|off \| find <key>` | Show the BibTeX target and citation status; run the pre-pass/merge for active dir corpora; toggle `@key` citation attach; resolve a key without attaching |
 | `/search topk <N> \| threshold <F> \| rank <name> \| by <file>` | Tune retrieval or search by document |
 | `/hist [list \| load <id> \| delete <id>]` | Manage saved sessions |
 | `/help` | Show available commands |

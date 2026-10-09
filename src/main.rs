@@ -31,6 +31,8 @@ use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 
+#[cfg(feature = "grobid")]
+mod cite;
 mod grobid;
 mod search;
 use grobid::GrobidPrepassConfig;
@@ -433,6 +435,12 @@ struct Session {
     /// headers, complete them against OpenAlex, rename files and/or merge
     /// their records into a BibTeX file before indexing a directory corpus.
     grobid: Option<GrobidPrepassConfig>,
+    /// Citation attach: an `@key` mention in a query resolves against the
+    /// BibTeX file (or the keyed file names of `--embed-rename`) and
+    /// attaches the paper's parsed PDF to the prompt.  Active only when the
+    /// pre-pass is configured; toggled with `/bibtex attach on|off`.
+    #[cfg(feature = "grobid")]
+    cite: cite::CiteState,
     /// Dynamic routing for web downloads (`/corpus dyn on|off`).  When on,
     /// `/download` and `/get` route documents into the first active URL
     /// corpus (else the first active directory corpus) instead of the main
@@ -632,6 +640,35 @@ fn resolve_attachment_text(parsers: &DocumentParsers, path: &std::path::Path) ->
     })
 }
 
+/// Characters per token, mirroring ragrig's prompt-size estimate (3), for
+/// the pre-generation warning about oversized citation attachments.
+#[cfg(feature = "grobid")]
+const CITATION_CHARS_PER_TOKEN: usize = 3;
+
+/// The citation sources of the running session: the configured BibTeX merge
+/// target (if any) and the folders of the active directory corpora.
+///
+/// Inactive corpora are excluded on purpose: a switched-off corpus should
+/// not leak files into a prompt, and URL corpora have no local PDF.
+#[cfg(feature = "grobid")]
+fn citation_sources<'a>(
+    grobid: Option<&GrobidPrepassConfig>,
+    corpora: &'a [CorpusEntry],
+) -> (Option<PathBuf>, Vec<&'a std::path::Path>) {
+    let bib = grobid
+        .and_then(|cfg| cfg.bibtex.as_ref())
+        .map(|bibtex| bibtex.path.clone());
+    let dirs = corpora
+        .iter()
+        .filter(|entry| entry.active)
+        .filter_map(|entry| match &entry.kind {
+            CorpusKind::Dir(folder) => Some(folder.folder()),
+            CorpusKind::Urls(_) => None,
+        })
+        .collect();
+    (bib, dirs)
+}
+
 /// Parse the `name=value` command-line corpus specs into document corpora.
 ///
 /// - `--corpus-dir name=path`  → a [`FolderCorpus`] named `name`.
@@ -732,6 +769,10 @@ async fn bootstrap(
             if count == 1 { "y" } else { "ies" },
             if bibtex.link { "on" } else { "off" }
         );
+    }
+    #[cfg(feature = "grobid")]
+    if grobid.is_some() {
+        info!("Citation attach: mention a key as @Key to attach its parsed PDF to the prompt.");
     }
 
     // Build generation params from config.
@@ -931,6 +972,8 @@ async fn bootstrap(
         corpora,
         dyn_corpora: true,
         grobid,
+        #[cfg(feature = "grobid")]
+        cite: cite::CiteState::default(),
         doc_parsers,
         pdf_parser,
         epub_parser: EpubParserBackend::Epub,
@@ -1199,6 +1242,45 @@ impl Session {
         Ok(())
     }
 
+    // ── Citation attach (`@key` mentions) ─────────────────────────────
+
+    /// Resolve `@key` mentions in `query` into one-shot PDF attachments.
+    ///
+    /// Active only when the GROBID pre-pass is configured (`--embed-rename`
+    /// and/or `--bibtex-merge`) and citation attach is on (`/bibtex attach`).
+    /// Every outcome — attachment or miss — is reported on stdout, so the
+    /// user sees what entered the prompt; a failure never fails the query.
+    #[cfg(feature = "grobid")]
+    fn resolve_query_citations(&mut self, query: &str) {
+        if self.grobid.is_none() || !self.cite.is_enabled() {
+            return;
+        }
+        let keys = cite::cite_keys(query);
+        if keys.is_empty() {
+            return;
+        }
+        let (bib, corpus_dirs) = citation_sources(self.grobid.as_ref(), &self.corpora);
+        let located = self.cite.locate(&keys, bib.as_deref(), &corpus_dirs);
+        let parsers = &self.doc_parsers;
+        let (documents, outcomes) =
+            cite::load_documents(&located, &|path| resolve_attachment_text(parsers, path));
+        for outcome in &outcomes {
+            println!("Citation: {}", outcome.describe());
+        }
+
+        // Attachments are merged into the context after the retrieval budget
+        // is spent, so warn when they alone exceed the context window.
+        let attached: usize = documents.iter().map(|doc| doc.content.len()).sum();
+        let budget_tokens = self.session.agent().context_tokens();
+        if attached > budget_tokens.saturating_mul(CITATION_CHARS_PER_TOKEN) {
+            println!(
+                "*** Citations: {attached} chars (\u{2248}{} tokens) exceed the {budget_tokens}-token context budget — expect an overflow; raise it with `/chat context <N>` or mention fewer keys. ***",
+                attached / CITATION_CHARS_PER_TOKEN
+            );
+        }
+        self.attached_docs.extend(documents);
+    }
+
     // ── /download <url> ───────────────────────────────────────────────
 
     /// Choose the destination for a runtime web download:
@@ -1452,7 +1534,7 @@ impl Session {
             "/corpus <name> on|off — toggle a named document corpus (--corpus-dir / --corpus-urls); /corpus dyn on|off — dynamic web-download routing"
         );
         println!(
-            "/bibtex show | merge — show the --bibtex-merge target, or run the GROBID pre-pass (and merge) for all active directory corpora"
+            "/bibtex show | merge | attach on|off | find <key> — show the target, run the pre-pass/merge for all active dir corpora, toggle @key citation attach, resolve a key"
         );
         println!("exit / quit     — end the session");
     }
@@ -3011,16 +3093,59 @@ impl Session {
         Ok(())
     }
 
-    // ── /bibtex [show | merge] ───────────────────────────────────────
+    // ── /bibtex [show | merge | attach | find] ───────────────────────
 
-    /// Show the BibTeX merge target, or run the GROBID pre-pass (including
-    /// the merge) for every active directory corpus.
+    /// Show the BibTeX merge target, run the GROBID pre-pass (including the
+    /// merge) for every active directory corpus, toggle the chat-side
+    /// citation attach, or resolve one key.
     ///
     /// `merge` is the manual equivalent of the automatic merge that runs
     /// before `/embed index` and `/embed update`: new and changed PDFs are
     /// parsed (unless only cached records need merging), then all records are
-    /// merged into the `.bib` file.
+    /// merged into the `.bib` file.  `attach on|off` and `find <key>` work
+    /// without a merge target, because the `--embed-rename` file names alone
+    /// can resolve keys.
     async fn cmd_bibtex(&mut self, args_str: &str) -> Result<()> {
+        let mut parts = args_str.split_whitespace();
+        let (head, tail) = (parts.next().unwrap_or(""), parts.next());
+
+        #[cfg(feature = "grobid")]
+        match head {
+            "attach" => {
+                match tail {
+                    Some("on") => {
+                        self.cite.set_enabled(true);
+                        println!(
+                            "Citation attach: on — @key mentions attach the paper's parsed PDF."
+                        );
+                    }
+                    Some("off") => {
+                        self.cite.set_enabled(false);
+                        println!("Citation attach: off — @key mentions stay plain text.");
+                    }
+                    _ => println!("Usage: /bibtex attach on|off"),
+                }
+                return Ok(());
+            }
+            "find" => {
+                if let Some(key) = tail {
+                    self.cmd_bibtex_find(key);
+                } else {
+                    println!("Usage: /bibtex find <key>");
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        #[cfg(not(feature = "grobid"))]
+        if matches!(head, "attach" | "find") {
+            println!(
+                "`/bibtex {head}` needs a build with the `grobid` cargo feature \
+                 (cargo build --features grobid)."
+            );
+            return Ok(());
+        }
+
         let Some(bibtex) = self.grobid.as_ref().and_then(|cfg| cfg.bibtex.as_ref()) else {
             println!(
                 "No BibTeX merge target configured — start with --bibtex-merge <FILE> \
@@ -3028,8 +3153,8 @@ impl Session {
             );
             return Ok(());
         };
-        match args_str.trim() {
-            "" | "show" => {
+        match (head, tail) {
+            ("" | "show", None) => {
                 let count = grobid::bibtex_entry_count(bibtex)?;
                 println!(
                     "BibTeX merge target: {} ({} entries, PDF links {}).",
@@ -3037,10 +3162,15 @@ impl Session {
                     count,
                     if bibtex.link { "on" } else { "off" }
                 );
-                println!("Usage: /bibtex show | merge");
+                #[cfg(feature = "grobid")]
+                println!(
+                    "Citation attach: {} — @key mentions attach the paper's parsed PDF.",
+                    if self.cite.is_enabled() { "on" } else { "off" }
+                );
+                println!("Usage: /bibtex show | merge | attach on|off | find <key>");
                 Ok(())
             }
-            "merge" => {
+            ("merge", None) => {
                 let mut corpora = 0usize;
                 for entry in self.corpora.iter().filter(|e| e.active) {
                     if let CorpusKind::Dir(folder) = &entry.kind {
@@ -3064,10 +3194,30 @@ impl Session {
                 }
                 Ok(())
             }
-            other => {
-                println!("Usage: /bibtex show | merge (got '{other}')");
+            _ => {
+                println!(
+                    "Usage: /bibtex show | merge | attach on|off | find <key> (got '{}')",
+                    args_str.trim()
+                );
                 Ok(())
             }
+        }
+    }
+
+    // ── /bibtex find <key> ──────────────────────────────────────────
+
+    /// Resolve one citation key and report where it points, without reading
+    /// or attaching anything.  Works while citation attach is off, and also
+    /// for `--embed-rename`-only sessions (the file-name fallback).
+    #[cfg(feature = "grobid")]
+    fn cmd_bibtex_find(&mut self, key: &str) {
+        let key = key.trim_start_matches('@').to_string();
+        let (bib, corpus_dirs) = citation_sources(self.grobid.as_ref(), &self.corpora);
+        let located = self
+            .cite
+            .locate(std::slice::from_ref(&key), bib.as_deref(), &corpus_dirs);
+        for item in &located {
+            println!("Citation: {}", item.describe());
         }
     }
 
@@ -3328,6 +3478,11 @@ impl Session {
             self.session.agent().chat_agent().backend_name(),
             self.session.agent().chat_agent().model_name()
         );
+
+        // `@key` mentions resolve before the attachment snapshot: their PDFs
+        // ride along with any `/attach`ed documents as one-shot attachments.
+        #[cfg(feature = "grobid")]
+        self.resolve_query_citations(query);
 
         let has_attachments = !self.attached_docs.is_empty();
         if has_attachments {
@@ -4643,6 +4798,8 @@ mod tests {
             attached_docs: Vec::new(),
             corpora,
             grobid: None,
+            #[cfg(feature = "grobid")]
+            cite: cite::CiteState::default(),
             dyn_corpora: true,
             log_level: Arc::new(RwLock::new("warn".into())),
         }
@@ -4714,6 +4871,11 @@ mod tests {
         session.cmd_bibtex("show").await.unwrap();
         session.cmd_bibtex("merge").await.unwrap();
         session.cmd_bibtex("bogus").await.unwrap();
+        // Toggling and finding work without a merge target: the keyed file
+        // names of `--embed-rename` alone can resolve keys.
+        session.cmd_bibtex("attach on").await.unwrap();
+        session.cmd_bibtex("attach off").await.unwrap();
+        session.cmd_bibtex("find Kahle2000").await.unwrap();
 
         assert!(session.session.turns().is_empty());
     }
@@ -4774,6 +4936,95 @@ mod tests {
         session.cmd_bibtex("merge").await.unwrap();
         assert_eq!(fs::read_to_string(&bib).unwrap(), text);
         session.cmd_bibtex("show").await.unwrap();
+    }
+
+    /// `@key` mentions resolve against the keyed file names and attach the
+    /// paper's parsed PDF — one-shot, toggled with `/bibtex attach`, and
+    /// still inspectable with `/bibtex find` while the toggle is off.
+    #[cfg(all(feature = "internal", feature = "grobid", feature = "test-fixtures"))]
+    #[tokio::test]
+    async fn citation_attachment_resolves_and_is_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus_dir = dir.path().join("papers");
+        fs::create_dir(&corpus_dir).unwrap();
+        let pdf = corpus_dir.join("Kano2022 - Kano - A study - 2022.pdf");
+        fs::write(&pdf, ragrig::fixtures::pdf::NEW_STATS).unwrap();
+
+        let mut session = cli_session(
+            dir.path(),
+            vec![CorpusEntry {
+                name: "papers".into(),
+                kind: CorpusKind::Dir(FolderCorpus::new(corpus_dir)),
+                active: true,
+            }],
+        );
+        // `--embed-rename` only: no BibTeX file, the keyed file name resolves.
+        session.grobid = Some(GrobidPrepassConfig {
+            url: "http://127.0.0.1:1".into(),
+            workers: 1,
+            rename: true,
+            bibtex: None,
+        });
+
+        session.resolve_query_citations("Compare @Kano2022 with the corpus");
+        assert_eq!(session.attached_docs.len(), 1, "one citation attachment");
+        let document = &session.attached_docs[0];
+        assert_eq!(document.name, "@Kano2022");
+        assert!(
+            document.content.len() > 100,
+            "parsed PDF text expected, got {} bytes",
+            document.content.len()
+        );
+
+        // Toggled off, mentions pass through; `find` keeps working.
+        session.attached_docs.clear();
+        session.cmd_bibtex("attach off").await.unwrap();
+        session.resolve_query_citations("Again @Kano2022");
+        assert!(session.attached_docs.is_empty());
+        session.cmd_bibtex("find Kano2022").await.unwrap();
+        session.cmd_bibtex("attach on").await.unwrap();
+
+        // A full RAG query consumes the one-shot attachment.
+        session
+            .cmd_rag_query("@Kano2022 what is this?")
+            .await
+            .unwrap();
+        assert!(session.attached_docs.is_empty(), "attachments are one-shot");
+    }
+
+    /// Resolution is off without the pre-pass, and inactive corpora do not
+    /// leak files into a prompt.
+    #[cfg(all(feature = "internal", feature = "grobid", feature = "test-fixtures"))]
+    #[tokio::test]
+    async fn citation_attachment_needs_prepass_and_active_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus_dir = dir.path().join("papers");
+        fs::create_dir(&corpus_dir).unwrap();
+        let pdf = corpus_dir.join("Kano2022 - Kano - A study - 2022.pdf");
+        fs::write(&pdf, ragrig::fixtures::pdf::NEW_STATS).unwrap();
+
+        let mut session = cli_session(
+            dir.path(),
+            vec![CorpusEntry {
+                name: "papers".into(),
+                kind: CorpusKind::Dir(FolderCorpus::new(corpus_dir)),
+                active: true,
+            }],
+        );
+        // No pre-pass: `@Kano2022` is not a citation.
+        session.resolve_query_citations("Compare @Kano2022");
+        assert!(session.attached_docs.is_empty());
+
+        // Pre-pass on, corpus off: the file stays out of the prompt.
+        session.grobid = Some(GrobidPrepassConfig {
+            url: "http://127.0.0.1:1".into(),
+            workers: 1,
+            rename: true,
+            bibtex: None,
+        });
+        session.corpora[0].active = false;
+        session.resolve_query_citations("Compare @Kano2022");
+        assert!(session.attached_docs.is_empty());
     }
 
     /// A transcript-strategy profile must leave the transcript on — this is

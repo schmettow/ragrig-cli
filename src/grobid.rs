@@ -16,7 +16,8 @@
 //!
 //! ragrig embeds chunk provenance including the file name, so meaningful
 //! names give the chat agent stable, human-readable citations; the BibTeX
-//! file gives the corpus a bibliography that survives re-indexing.
+//! file gives the corpus a bibliography that survives re-indexing and lets
+//! the chat attach a paper when a query mentions its key (`@Key`).
 //!
 //! The work is delegated to the [`grobid_bibtex`] crate:
 //! [`grobid_bibtex::files::collect_pdfs`] and
