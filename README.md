@@ -463,6 +463,12 @@ under a pipeline that has not been indexed yet is an error.
 | `/help` | Show available commands |
 | `exit` / `quit` | End session |
 
+PDF parsing cascades: the selected backend is tried first, then the
+fallbacks in order — kreuzberg (when compiled), unpdf, and finally
+sloppy-pdf, which never panics.  The first parser that yields text wins, so
+a document with, for example, a missing Unicode map (which makes
+pdf-extract panic) still parses and indexes.
+
 ### Model parameters
 
 Fine-tune generation at startup or mid-session:

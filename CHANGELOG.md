@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves a key without attaching (both work without a merge target).
   Requires `grobid-bibtex` 0.2.1 (`Collection::cite_entries`).
 
+### Fixed
+
+- **PDF parsing cascade includes unpdf** — the parser list now always tries
+  `unpdf` after the selected backend and before the never-panicking
+  `sloppy-pdf` (and `kreuzberg` when compiled), in a fixed cascade order
+  with the selected backend first.  Some publisher PDFs (Type 1C subset
+  fonts without a Unicode map) make `pdf-extract` panic and leave
+  `sloppy-pdf` with nothing to scavenge; `unpdf` reads them through their
+  builtin encodings, so such papers now index, chunk, and resolve as `@key`
+  citation attachments instead of failing (found via `examples/pdf_bench`
+  with an Ando 2002 paper, which poppler reads but pdf-extract cannot).
+
 ## v1.4.0
 
 ### Fixed

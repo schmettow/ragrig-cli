@@ -567,8 +567,15 @@ fn pdf_backend_names() -> Vec<&'static str> {
     names
 }
 
-/// Filter the parser list to include the selected PDF backend as primary,
-/// plus a panic-fallback (kreuzberg when available, otherwise sloppy-pdf).
+/// Build the PDF parsing cascade: the selected backend first, then the
+/// forgiving fallbacks — kreuzberg (when compiled), unpdf, and sloppy-pdf,
+/// which never panics.
+///
+/// The cascade is what keeps PDF parsing robust across producers: a parser
+/// that fails (or panics) on a document falls through to the next.  For
+/// example, pdf-extract panics on subset fonts without a Unicode map, and
+/// unpdf reads those documents through their builtin encodings.  The other
+/// formats keep the canonical build order.
 fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn DocumentParser>> {
     let selected_pdf = match pdf {
         #[cfg(feature = "kreuzberg")]
@@ -591,23 +598,33 @@ fn filtered_parsers(pdf: &PdfParserBackend, _sloppy_pdf: bool) -> Vec<Box<dyn Do
         // New backends added upstream: fall back to the legacy default.
         _ => "pdf-extract",
     };
-    let fallback = {
-        #[cfg(feature = "kreuzberg")]
-        {
-            "kreuzberg"
-        }
-        #[cfg(not(feature = "kreuzberg"))]
-        {
-            "sloppy-pdf"
-        }
-    };
+
+    // The selected backend leads; the fallbacks follow in quality order,
+    // each at most once.
+    let mut cascade: Vec<&str> = vec![selected_pdf];
+    #[cfg(feature = "kreuzberg")]
+    if !cascade.contains(&"kreuzberg") {
+        cascade.push("kreuzberg");
+    }
+    if !cascade.contains(&"unpdf") {
+        cascade.push("unpdf");
+    }
+    if !cascade.contains(&"sloppy-pdf") {
+        cascade.push("sloppy-pdf");
+    }
+
     let mut list = parsers::build_parsers();
-    list.retain(|p| {
+    list.retain(|p| !p.extensions().contains(&"pdf") || cascade.contains(&p.name()));
+    // `build_parsers` returns the canonical quality order; the cascade above
+    // defines the order that is actually tried (selected first).
+    list.sort_by_key(|p| {
         if p.extensions().contains(&"pdf") {
-            // Keep the selected parser plus the fallback (don't duplicate if selected == fallback).
-            p.name() == selected_pdf || p.name() == fallback
+            cascade
+                .iter()
+                .position(|name| *name == p.name())
+                .unwrap_or(usize::MAX)
         } else {
-            true
+            usize::MAX
         }
     });
     list
@@ -4624,6 +4641,68 @@ mod tests {
             err.to_string().contains("no parser registered"),
             "expected a no-parser error, got: {err}"
         );
+    }
+
+    /// The PDF cascade is ordered: the selected backend first, then the
+    /// forgiving fallbacks (unpdf before the never-panicking sloppy-pdf),
+    /// without duplicates.
+    #[test]
+    fn filtered_parsers_orders_the_pdf_cascade() {
+        let chain = |backend: &PdfParserBackend| -> Vec<&'static str> {
+            filtered_parsers(backend, false)
+                .iter()
+                .filter(|parser| parser.extensions().contains(&"pdf"))
+                .map(|parser| parser.name())
+                .collect()
+        };
+
+        let extract = chain(&PdfParserBackend::Extract);
+        assert_eq!(extract.first(), Some(&"pdf-extract"), "{extract:?}");
+        assert!(extract.contains(&"unpdf"), "{extract:?}");
+        assert_eq!(extract.last(), Some(&"sloppy-pdf"), "{extract:?}");
+
+        let unpdf = chain(&PdfParserBackend::Unpdf);
+        assert_eq!(unpdf.first(), Some(&"unpdf"), "{unpdf:?}");
+
+        // sloppy-pdf is the user's choice first, but even a failed scavenge
+        // still falls through to unpdf.
+        let sloppy = chain(&PdfParserBackend::Internal);
+        assert_eq!(sloppy.first(), Some(&"sloppy-pdf"), "{sloppy:?}");
+        assert!(sloppy.contains(&"unpdf"), "{sloppy:?}");
+
+        let sink = chain(&PdfParserBackend::Sink);
+        assert_eq!(sink.first(), Some(&"pdfsink"), "{sink:?}");
+
+        for backend in [
+            PdfParserBackend::Extract,
+            PdfParserBackend::Unpdf,
+            PdfParserBackend::Sink,
+            PdfParserBackend::Internal,
+        ] {
+            let chain = chain(&backend);
+            let mut deduped = chain.clone();
+            deduped.dedup();
+            assert_eq!(deduped, chain, "no duplicates: {chain:?}");
+        }
+    }
+
+    /// A Type 1C PDF whose subset fonts carry no Unicode map makes
+    /// pdf-extract panic (`missing unicode map and encoding`); the cascade
+    /// falls through to unpdf, so indexing and `@key` citation attachments
+    /// still get text.  Runs only when the local `Pdf_fail` fixture is
+    /// present; fresh checkouts skip it.
+    #[test]
+    fn pdf_cascade_survives_missing_unicode_map() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "Pdf_fail/Ando2002 - Shinki Ando - LuminanceInduced Shift in the Apparent Direction of Gaze - 2002.pdf",
+        );
+        if !path.is_file() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let parsers = DocumentParsers::new(filtered_parsers(&PdfParserBackend::Extract, false));
+        let text = ragrig::extract_text(&parsers, &path).expect("cascade parses the PDF");
+        assert!(text.contains("sclera"), "{} chars extracted", text.len());
     }
 
     // ── Profile round-trip ───────────────────────────────────────────
