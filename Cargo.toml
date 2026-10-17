@@ -3,11 +3,14 @@ name = "ragrig-cli"
 version = "1.4.0"
 edition = "2024"
 rust-version = "1.89"
-description = "REPL binary for the Ragrig RAG framework — paper search, chat, and document indexing."
+description = "REPL for the Ragrig RAG framework — paper search, chat, document indexing, GROBID pre-pass and BibTeX citation attach"
 license = "MIT"
 repository = "https://github.com/schmettow/ragrig-cli"
 readme = "README.md"
-keywords = ["rag", "llm", "repl", "ollama"]
+# Keep agent instructions and local benchmark artifacts out of the published
+# crate.
+exclude = ["AGENTS.md", "Pdf_fail/**"]
+keywords = ["rag", "llm", "repl", "ollama", "bibtex"]
 categories = ["command-line-utilities", "science"]
 
 [features]
@@ -50,9 +53,8 @@ all = [
 [dependencies]
 ragrig = "1"
 # Optional: the shared GROBID pre-pass and `@key` citation attach from
-# grobid-bibtex. The path serves local co-development; publish grobid-bibtex
-# 0.3.0 (the `pipeline` feature) before ragrig-cli.
-grobid-bibtex = { version = "0.3.0", path = "../grobid-bibtex", optional = true }
+# grobid-bibtex 0.3.0 (the `pipeline` feature), resolved from crates.io.
+grobid-bibtex = { version = "0.3.0", optional = true }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }

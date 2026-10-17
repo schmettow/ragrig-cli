@@ -11,7 +11,7 @@ All notable changes to ragrig-cli are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## v1.5.0
+## v1.4.0
 
 ### Added
 
@@ -28,37 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attachment set larger than the context budget warns before generation.
   `/bibtex attach on|off` toggles the behaviour, `/bibtex find <key>`
   resolves a key without attaching (both work without a merge target).
-  Requires `grobid-bibtex` 0.2.1 (`Collection::cite_entries`).
-
-### Fixed
-
-- **PDF parsing cascade includes unpdf** — the parser list now always tries
-  `unpdf` after the selected backend and before the never-panicking
-  `sloppy-pdf` (and `kreuzberg` when compiled), in a fixed cascade order
-  with the selected backend first.  Some publisher PDFs (Type 1C subset
-  fonts without a Unicode map) make `pdf-extract` panic and leave
-  `sloppy-pdf` with nothing to scavenge; `unpdf` reads them through their
-  builtin encodings, so such papers now index, chunk, and resolve as `@key`
-  citation attachments instead of failing (found via `examples/pdf_bench`
-  with an Ando 2002 paper, which poppler reads but pdf-extract cannot).
-
-## v1.4.0
-
-### Fixed
-
-- **`/embed` argument parsing** — `/embed` now resolves its keyword
-  subcommands (`show`, `purge`, `index`, `update`, `topk`, `threshold`)
-  case-insensitively and *before* falling back to a `<backend> [model]`
-  spec, so a tuning keyword can never again be mistaken for an embedding
-  backend.  `similarity_threshold` is accepted as an alias for
-  `threshold` (the spelling users reach for after seeing the config field
-  and CLI flag), a stray third token such as
-  `/embed ollama similarity_threshold 0.03` is rejected instead of being
-  silently swallowed as the model name while the value was dropped, and
-  `/embed show` now labels the value `threshold:` to match `/search`.
-
-### Added
-
+  Requires `grobid-bibtex` 0.3.0.
 - **`--bibtex-merge <FILE>`** (with the `grobid` cargo feature) — maintain a
   BibTeX file for the directory corpora: every PDF that the GROBID pre-pass
   processes has its reference merged into `FILE` with the duplicate detection
@@ -81,29 +51,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records, `collection::merge_file`), which `pdf2bibtex --merge` now uses as
   well.
 
+### Changed
+
+- **Shared GROBID pipeline** — citation attach and the pre-pass now call
+  `grobid-bibtex` 0.3.0 (`grobid_bibtex::cite` and the `pipeline` feature's
+  `prepass`) instead of binary-local orchestration.  The manifest format and
+  rename policy are shared with `pdf2bibtex`/sciscraper, and the dependency
+  is resolved from crates.io (the local path was dropped).
+
+### Fixed
+
+- **`/embed` argument parsing** — `/embed` now resolves its keyword
+  subcommands (`show`, `purge`, `index`, `update`, `topk`, `threshold`)
+  case-insensitively and *before* falling back to a `<backend> [model]`
+  spec, so a tuning keyword can never again be mistaken for an embedding
+  backend.  `similarity_threshold` is accepted as an alias for
+  `threshold` (the spelling users reach for after seeing the config field
+  and CLI flag), a stray third token such as
+  `/embed ollama similarity_threshold 0.03` is rejected instead of being
+  silently swallowed as the model name while the value was dropped, and
+  `/embed show` now labels the value `threshold:` to match `/search`.
+- **PDF parsing cascade includes unpdf** — the parser list now always tries
+  `unpdf` after the selected backend and before the never-panicking
+  `sloppy-pdf` (and `kreuzberg` when compiled), in a fixed cascade order
+  with the selected backend first.  Some publisher PDFs (Type 1C subset
+  fonts without a Unicode map) make `pdf-extract` panic and leave
+  `sloppy-pdf` with nothing to scavenge; `unpdf` reads them through their
+  builtin encodings, so such papers now index, chunk, and resolve as `@key`
+  citation attachments instead of failing (found via `examples/pdf_bench`
+  with an Ando 2002 paper, which poppler reads but pdf-extract cannot).
+
 ### Quality
 
 - **Test coverage** (`cargo llvm-cov --features all,offline`; the single
   `src/main.rs` test target — the crate has no integration or doc tests):
-  `grobid.rs` 89.7%, `main.rs` 35.8% and `search.rs` 0.0% line coverage —
-  41.7% overall.  `main.rs` is the REPL driver (bootstrap, command
-  dispatch, the live Ollama and embedding paths) and `search.rs` the live
-  arXiv/Semantic Scholar clients; both are exercised through the REPL
-  rather than unit tests, while the parsing, profile and GROBID pre-pass
-  logic the tests target is well covered (`grobid.rs` ~90%).
+  `grobid.rs` 94.9%, `main.rs` 41.4% and `search.rs` 0.0% line coverage —
+  41.8% overall.  `main.rs` is the REPL driver (bootstrap, command dispatch,
+  the live Ollama and embedding paths) and `search.rs` the live arXiv/
+  Semantic Scholar clients; both are exercised through the REPL rather than
+  unit tests, while the parsing, profile and shared GROBID pipeline logic
+  the tests target is well covered (`grobid.rs` ~95%).
 - **Verification**: `cargo fmt --check`, `cargo check --all-targets
   --features all,offline`, `cargo clippy --all-targets --features
   all,offline -- -D warnings`, `cargo doc --no-deps --features all,offline`
   (with `RUSTDOCFLAGS="-D warnings"`) and `cargo test --features
-  all,offline` (69 unit tests pass, 1 ignored — it needs a live Ollama
-  model) all pass.  `cargo package --list` ships the expected 12 files,
-  and `cargo publish --dry-run` packages and verifies the crate
-  (536.3 KiB, 136.4 KiB compressed) with `ragrig` 1.1.1 and
-  `grobid-bibtex` 0.2.0 resolved from crates.io.  `--all-features` cannot
+  all,offline` (66 unit tests pass, 1 ignored — it needs a live Ollama
+  model) all pass.  `cargo package --list` ships 11 files, and
+  `cargo publish --dry-run` packages and verifies the crate
+  (531.7 KiB, 135.9 KiB compressed) with `ragrig` 1.1.1 and
+  `grobid-bibtex` 0.3.0 resolved from crates.io.  `--all-features` cannot
   build on this Linux host: the `internal-generate-metal`/`offline-metal`
   features pull in the macOS-only `objc2`, and the CUDA/MKL variants need
   toolkits that are not installed; `all,offline` enables every other
   feature.
+- **No live server run**: no GROBID server or Ollama model was provided for
+  this pass; the pre-pass and citation paths are covered by the mock-server
+  and fixture tests, and the one ignored test needs a live Ollama model.
 
 ## v1.3.0
 
