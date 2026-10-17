@@ -3836,10 +3836,11 @@ dependencies = [
 
 [[package]]
 name = "grobid-bibtex"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "biblatex",
  "grobid",
+ "log",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -7447,7 +7448,7 @@ dependencies = [
 
 [[package]]
 name = "ragrig-cli"
-version = "1.5.0"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "clap",

@@ -32,7 +32,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{self, EnvFilter, fmt};
 
 #[cfg(feature = "grobid")]
-mod cite;
+use grobid_bibtex::cite;
 mod grobid;
 mod search;
 use grobid::GrobidPrepassConfig;
@@ -1279,11 +1279,19 @@ impl Session {
         let (bib, corpus_dirs) = citation_sources(self.grobid.as_ref(), &self.corpora);
         let located = self.cite.locate(&keys, bib.as_deref(), &corpus_dirs);
         let parsers = &self.doc_parsers;
-        let (documents, outcomes) =
-            cite::load_documents(&located, &|path| resolve_attachment_text(parsers, path));
+        let (loaded, outcomes) = cite::load_documents(&located, &|path| {
+            resolve_attachment_text(parsers, path).map_err(|error| format!("{error:#}"))
+        });
         for outcome in &outcomes {
             println!("Citation: {}", outcome.describe());
         }
+        let documents: Vec<AttachedDocument> = loaded
+            .into_iter()
+            .map(|document| AttachedDocument {
+                name: format!("@{}", document.key),
+                content: document.text,
+            })
+            .collect();
 
         // Attachments are merged into the context after the retrieval budget
         // is spent, so warn when they alone exceed the context window.
