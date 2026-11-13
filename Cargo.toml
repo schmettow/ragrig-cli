@@ -1,6 +1,6 @@
 [package]
 name = "ragrig-cli"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 rust-version = "1.89"
 description = "REPL for the Ragrig RAG framework — paper search, chat, document indexing, GROBID pre-pass and BibTeX citation attach"
@@ -54,14 +54,14 @@ all = [
 # The path keeps local development on the in-tree ragrig; the version is what
 # crates.io users resolve.  ragrig 1.4 (cloud embedders) must be published
 # before ragrig-cli 1.4.0 can be.
-ragrig = { version = "1.4", path = "../ragrig" }
+ragrig = { version = "1.4"}
 # Optional: the shared GROBID pre-pass and `@key` citation attach from
 # grobid-bibtex 0.3.0 (the `pipeline` feature), resolved from crates.io.
-grobid-bibtex = { version = "0.3.0", optional = true }
+grobid-bibtex = { version = "0.4.0", optional = true }
 
 # ── CLI / REPL ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
-rustyline = "18.0"
+rustyline = "19.0"
 # Cross-platform terminal control: raw mode plus low-level key events
 # for the ESC-cancel watcher (replaces the Unix-only nix termios code).
 crossterm = "0.29"
