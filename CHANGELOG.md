@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cloud embedding providers** — `--embedding-provider` and `/embed` now
+  accept `openai`, `mistral`, `openrouter`, and `llamacpp`, backed by
+  ragrig's `CloudEmbedder`.  Omitting `--embedding-model` uses the provider's
+  default (`text-embedding-3-small`, `mistral-embed`,
+  `openai/text-embedding-3-small`, or `LLaMA_CPP`).  `deepseek` and
+  `claude`/`anthropic` are rejected with an explanation because those
+  providers expose no embeddings API.
+- **`--embedding-provider` is validated at parse time** — clap rejects
+  unknown providers instead of silently falling back to Ollama, and the flag
+  now carries a typed `EmbeddingProvider`.
 - **Citation attach in chat (`@key`)** — with the `grobid` cargo feature and
   the GROBID pre-pass configured (`--embed-rename` and/or `--bibtex-merge`),
   a plain query may mention citation keys, e.g. `Compare @Kano2022 with the
@@ -53,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Profiles no longer store API keys** — `/profile save` strips
+  `deepseek_api_key`, `llamacpp_api_key`, and `semantic_scholar_api_key`
+  from the written JSON and warns.  Set `DEEPSEEK_API_KEY`,
+  `LLAMACPP_API_KEY`, and `SEMANTIC_SCHOLAR_API_KEY` in the environment.
+  Older profiles that contain the fields still load.
 - **Shared GROBID pipeline** — citation attach and the pre-pass now call
   `grobid-bibtex` 0.3.0 (`grobid_bibtex::cite` and the `pipeline` feature's
   `prepass`) instead of binary-local orchestration.  The manifest format and

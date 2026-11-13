@@ -388,6 +388,19 @@ Query > /embed fastembed
 Embedder swapped: Ollama (nomic-embed-text) → Fastembed (Nomic-Embed-Text-v1.5)
 ```
 
+**Switch embeddings to a cloud provider (key from the environment):**
+
+```
+$ OPENAI_API_KEY=sk-... ragrig --embedding-provider openai
+Query > /embed mistral mistral-embed
+```
+
+Available cloud backends: `openai`, `mistral`, `openrouter`, and `llamacpp`.
+Omitted models fall back to the provider's default.  Credentials are read
+only from `OPENAI_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, and
+(optionally) `LLAMACPP_API_KEY`; `/profile save` strips secrets from the
+written JSON and warns.  DeepSeek and Anthropic provide no embeddings API.
+
 **Experiment with ranking algorithms — same index, different retrieval:**
 
 ```
@@ -564,8 +577,10 @@ Options:
       --deepseek-api-key <KEY>     DeepSeek API key [env: DEEPSEEK_API_KEY]
       --deepseek-model <MODEL>     DeepSeek model [default: deepseek-v4-pro]
   -m, --model <MODEL>              Ollama chat model [default: qwen3.5:9b]
-      --embedding-provider <P>     Embedding: ollama (default) or fastembed
-  -e, --embedding-model <MODEL>    Ollama embedding model [default: nomic-embed-text]
+      --embedding-provider <P>     Embedding backend: ollama (default), fastembed,
+                                   openai, mistral, openrouter, llamacpp
+  -e, --embedding-model <MODEL>    Embedding model [default: the provider's own;
+                                   nomic-embed-text:latest for ollama]
       --memory-model <MODEL>       Memory/rewrite model [default: qwen2.5:1.5b]
       --memory-strategy <MODE>     Memory strategy: rewrite, transcript, log, summary, off
                                    [default: rewrite]

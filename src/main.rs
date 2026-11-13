@@ -67,17 +67,47 @@ struct CliChatConfig {
     pub prompt_chat: Option<PathBuf>,
 }
 
+/// Parse `--embedding-provider`, rejecting providers that have no
+/// embeddings API instead of silently falling back to Ollama.
+fn parse_embedding_provider(value: &str) -> Result<EmbeddingProvider, String> {
+    match value.to_lowercase().as_str() {
+        "ollama" => Ok(EmbeddingProvider::Ollama),
+        #[cfg(feature = "internal-embed")]
+        "fastembed" => Ok(EmbeddingProvider::Fastembed),
+        #[cfg(not(feature = "internal-embed"))]
+        "fastembed" => Err(
+            "this build has no fastembed support; rebuild with --features internal-embed".into(),
+        ),
+        "openai" => Ok(EmbeddingProvider::OpenAi),
+        "mistral" => Ok(EmbeddingProvider::Mistral),
+        "openrouter" => Ok(EmbeddingProvider::OpenRouter),
+        "llamacpp" | "llama.cpp" | "llama-cpp" | "llama_cpp" => Ok(EmbeddingProvider::LlamaCpp),
+        "deepseek" => Err(
+            "DeepSeek has no embeddings API; choose openai, mistral, openrouter, or llamacpp"
+                .into(),
+        ),
+        "claude" | "anthropic" => Err(
+            "Anthropic has no embeddings API; choose openai, mistral, openrouter, or llamacpp"
+                .into(),
+        ),
+        other => Err(format!(
+            "unknown embedding provider '{other}' (expected ollama, fastembed, openai, mistral, openrouter, or llamacpp)"
+        )),
+    }
+}
+
 /// CLI arguments for the embedding / retrieval sub-system.
 #[derive(clap::Args, Debug)]
 struct CliEmbedConfig {
-    #[arg(long = "embedding-provider", default_value = "ollama")]
-    pub embedding_provider: String,
     #[arg(
-        short = 'e',
-        long = "embedding-model",
-        default_value = "nomic-embed-text:latest"
+        long = "embedding-provider",
+        default_value = "ollama",
+        value_parser = parse_embedding_provider
     )]
-    pub embedding_model: String,
+    pub embedding_provider: EmbeddingProvider,
+    /// Model for the selected backend.  Omitted = the provider's default.
+    #[arg(short = 'e', long = "embedding-model")]
+    pub embedding_model: Option<String>,
     #[arg(long, default_value = "50")]
     pub top_k: usize,
     #[arg(long, default_value = "0.04")]
@@ -110,7 +140,9 @@ struct CliMemoryConfig {
 
 /// CLI arguments — thin `clap` wrapper that converts into the library `RagrigConfig`.
 #[derive(Parser, Debug)]
-#[command(about = "Pure Rust local RAG — chunkedrs + rig + Ollama/DeepSeek/Fastembed")]
+#[command(
+    about = "Pure Rust RAG — chunkedrs + rig + Ollama, OpenAI, Claude, Mistral, OpenRouter, llama.cpp, Fastembed"
+)]
 struct Cli {
     /// Workspace directory for the vector store, history, sessions, and
     /// profiles.  Defaults to the current directory.
@@ -187,6 +219,8 @@ impl From<CliChatConfig> for ChatConfig {
             model: c.model,
             deepseek_api_key: c.deepseek_api_key,
             deepseek_model: c.deepseek_model,
+            llamacpp_base_url: None,
+            llamacpp_api_key: None,
             params: GenerationParams {
                 temperature: c.temperature,
                 top_p: c.top_p,
@@ -206,13 +240,15 @@ impl From<CliChatConfig> for ChatConfig {
 
 impl From<CliEmbedConfig> for EmbedConfig {
     fn from(c: CliEmbedConfig) -> Self {
+        let provider = c.embedding_provider;
+        let model = c
+            .embedding_model
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| provider.default_model().to_string());
         EmbedConfig {
-            provider: match c.embedding_provider.as_str() {
-                #[cfg(feature = "internal-embed")]
-                "fastembed" => EmbeddingProvider::Fastembed,
-                _ => EmbeddingProvider::Ollama,
-            },
-            model: c.embedding_model,
+            provider,
+            model,
             top_k: c.top_k,
             similarity_threshold: c.similarity_threshold,
             request_timeout_secs: None,
@@ -822,20 +858,9 @@ async fn bootstrap(
         config.parse.chunk_overlap
     );
 
-    // Build the initial embedding backend from config.
-    let embedder_spec = match config.embed.provider {
-        EmbeddingProvider::Ollama => EmbedderSpec::Ollama {
-            model: config.embed.model.clone(),
-            request_timeout_secs: None,
-        },
-        #[cfg(feature = "internal-embed")]
-        EmbeddingProvider::Fastembed => EmbedderSpec::Fastembed,
-        // New embedding backends added upstream: fall back to Ollama.
-        _ => EmbedderSpec::Ollama {
-            model: config.embed.model.clone(),
-            request_timeout_secs: None,
-        },
-    };
+    // Build the initial embedding backend from config.  Credentials for
+    // cloud providers come from the environment (never from the profile).
+    let embedder_spec = EmbedderSpec::try_from(&config.embed)?;
     let embedder = embedder_spec.build()?;
     info!(
         "Embed: {} ({})",
@@ -2262,6 +2287,9 @@ impl Session {
                     "  backends: {}",
                     EmbedderSpec::available_backends().join(", ")
                 );
+                println!(
+                    "  cloud keys (env only): OPENAI_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY, LLAMACPP_API_KEY"
+                );
             }
 
             EmbedCommand::Show => {
@@ -3369,20 +3397,10 @@ impl Session {
             .agent_mut()
             .set_context_tokens(self.config.chat.context_tokens);
 
-        // Embedding backend + retrieval tuning.
-        let embedder_spec = match self.config.embed.provider {
-            EmbeddingProvider::Ollama => EmbedderSpec::Ollama {
-                model: self.config.embed.model.clone(),
-                request_timeout_secs: None,
-            },
-            #[cfg(feature = "internal-embed")]
-            EmbeddingProvider::Fastembed => EmbedderSpec::Fastembed,
-            // New embedding backends added upstream: fall back to Ollama.
-            _ => EmbedderSpec::Ollama {
-                model: self.config.embed.model.clone(),
-                request_timeout_secs: None,
-            },
-        };
+        // Embedding backend + retrieval tuning.  Cloud credentials come from
+        // the environment; a missing key aborts the profile load with a
+        // message instead of silently falling back to Ollama.
+        let embedder_spec = EmbedderSpec::try_from(&self.config.embed)?;
         match embedder_spec.build() {
             Ok(embedder) => {
                 self.session.agent_mut().set_embedder(embedder);
@@ -3429,6 +3447,10 @@ impl Session {
         self.config.embed.provider = match self.session.agent().embedder().backend_name() {
             #[cfg(feature = "internal-embed")]
             "Fastembed" => EmbeddingProvider::Fastembed,
+            "OpenAI" => EmbeddingProvider::OpenAi,
+            "Mistral" => EmbeddingProvider::Mistral,
+            "OpenRouter" => EmbeddingProvider::OpenRouter,
+            "llama.cpp" | "LlamaCpp" => EmbeddingProvider::LlamaCpp,
             _ => EmbeddingProvider::Ollama,
         };
         self.config.memory.strategy = self.session.memory_strategy();
@@ -4226,6 +4248,28 @@ mod tests {
     }
 
     // ── CLI clap parsing (--corpus-dir / --corpus-urls) ───────────────
+
+    #[test]
+    fn cli_parses_cloud_embedding_provider_and_default_model() {
+        let cli = Cli::try_parse_from(["ragrig", "--embedding-provider", "openai"])
+            .expect("cloud embedding provider should parse");
+        assert_eq!(cli.embed.embedding_provider, EmbeddingProvider::OpenAi);
+        assert!(cli.embed.embedding_model.is_none());
+
+        let config = EmbedConfig::from(cli.embed);
+        assert_eq!(config.provider, EmbeddingProvider::OpenAi);
+        assert_eq!(config.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn cli_rejects_embedding_providers_without_endpoints() {
+        for provider in ["deepseek", "claude", "anthropic", "bogus"] {
+            assert!(
+                Cli::try_parse_from(["ragrig", "--embedding-provider", provider]).is_err(),
+                "--embedding-provider {provider} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn cli_parses_corpus_flags() {
