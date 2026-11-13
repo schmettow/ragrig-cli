@@ -51,7 +51,10 @@ all = [
 ]
 
 [dependencies]
-ragrig = "1"
+# The path keeps local development on the in-tree ragrig; the version is what
+# crates.io users resolve.  ragrig 1.4 (cloud embedders) must be published
+# before ragrig-cli 1.4.0 can be.
+ragrig = { version = "1.4", path = "../ragrig" }
 # Optional: the shared GROBID pre-pass and `@key` citation attach from
 # grobid-bibtex 0.3.0 (the `pipeline` feature), resolved from crates.io.
 grobid-bibtex = { version = "0.3.0", optional = true }
